@@ -2,11 +2,9 @@ import {
   Decoration,
   DecorationSet,
   EditorView,
-  ViewPlugin,
-  ViewUpdate,
   WidgetType,
 } from '@codemirror/view';
-import { RangeSetBuilder } from '@codemirror/state';
+import { RangeSetBuilder, StateField, EditorState } from '@codemirror/state';
 import katex from 'katex';
 
 // ── Widget ────────────────────────────────────────────────────────────────────
@@ -156,60 +154,44 @@ function scanMath(text: string): MathRange[] {
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-function buildMathDecorations(view: EditorView): DecorationSet {
-  const docText = view.state.doc.toString();
+/**
+ * StateField (not ViewPlugin) because CM6 only permits block-replace decorations
+ * that span line breaks when provided via StateField, not ViewPlugin.
+ */
+function buildMathDecorations(state: EditorState): DecorationSet {
+  const docText = state.doc.toString();
   const builder = new RangeSetBuilder<Decoration>();
+  const selRanges = state.selection.ranges;
 
   for (const r of scanMath(docText)) {
-    // Skip ranges outside the viewport
-    const visible = view.visibleRanges.some(({ from, to }) => r.from < to && r.to > from);
-    if (!visible) continue;
-
-    // Show raw when cursor is inside
-    const cursorInside = view.state.selection.ranges.some(
+    const cursorInside = selRanges.some(
       (sel) => sel.from <= r.to && sel.to >= r.from
     );
     if (cursorInside) continue;
 
-    // For multi-line ranges, use widget + line marks (cannot use replace on line breaks)
-    const startLine = view.state.doc.lineAt(r.from);
-    const endLine = view.state.doc.lineAt(r.to - 1);
-    const isMultiLine = startLine.number !== endLine.number;
+    const isMultiLine =
+      state.doc.lineAt(r.from).number !== state.doc.lineAt(r.to - 1).number;
 
-    if (isMultiLine) {
-      // Add widget at the start
-      builder.add(r.from, r.from, Decoration.widget({
-        widget: new MathWidget(r.content, r.display),
-        side: -1,
-      }));
-      // Hide source lines
-      for (let lineNum = startLine.number; lineNum <= endLine.number; lineNum++) {
-        const line = view.state.doc.line(lineNum);
-        builder.add(line.from, line.from, Decoration.line({ class: 'cm-latex-math-hidden' }));
-      }
-    } else {
-      // Single-line math can use replace safely
-      builder.add(r.from, r.to, Decoration.replace({ widget: new MathWidget(r.content, r.display) }));
-    }
+    builder.add(
+      r.from,
+      r.to,
+      Decoration.replace({ widget: new MathWidget(r.content, r.display), block: isMultiLine })
+    );
   }
 
   return builder.finish();
 }
 
-// ── Plugin ────────────────────────────────────────────────────────────────────
+// ── StateField ────────────────────────────────────────────────────────────────
 
-export const mathDecorations = ViewPlugin.fromClass(
-  class {
-    decorations: DecorationSet;
-    constructor(view: EditorView) { this.decorations = buildMathDecorations(view); }
-    update(update: ViewUpdate) {
-      if (update.docChanged || update.selectionSet || update.viewportChanged) {
-        this.decorations = buildMathDecorations(update.view);
-      }
-    }
+export const mathDecorations = StateField.define<DecorationSet>({
+  create(state) { return buildMathDecorations(state); },
+  update(decs, tr) {
+    if (tr.docChanged || tr.selection !== undefined) return buildMathDecorations(tr.state);
+    return decs.map(tr.changes);
   },
-  { decorations: (v) => v.decorations }
-);
+  provide: (f) => EditorView.decorations.from(f),
+});
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
@@ -223,13 +205,5 @@ export const mathDecorationsTheme = EditorView.baseTheme({
     textAlign: 'center',
     margin: '0.75em 0',
     overflowX: 'auto',
-  },
-  '.cm-latex-math-hidden': {
-    opacity: '0',
-    pointerEvents: 'none',
-    height: '0',
-    margin: '0',
-    padding: '0',
-    lineHeight: '0',
   },
 });

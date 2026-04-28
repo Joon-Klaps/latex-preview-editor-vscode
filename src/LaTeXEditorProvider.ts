@@ -1,4 +1,19 @@
 import * as vscode from 'vscode';
+import { spawnSync } from 'child_process';
+import * as path from 'path';
+
+// ── Diff types (mirrored from webview/decorations/diff.ts) ───────────────────
+
+interface DiffLine { line: number; type: 'added' | 'modified'; }
+interface DiffDeleted { afterLine: number; }
+interface InlineSpan {
+  line: number;   // 1-based line in new file
+  from: number;   // char offset within that line (0-based, in clean new-file text)
+  to: number;     // exclusive
+  type: 'add' | 'del';
+  text?: string;  // only for 'del': the removed text to show inline
+}
+interface DiffData { lines: DiffLine[]; deletions: DiffDeleted[]; inline: InlineSpan[]; }
 
 export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
   public static readonly viewType = 'latex-preview.editor';
@@ -14,7 +29,6 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
       enableScripts: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, 'dist'),
-        vscode.Uri.joinPath(this.context.extensionUri, 'node_modules', 'katex', 'dist'),
       ],
     };
 
@@ -24,10 +38,11 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     // so we don't echo it back and cause an infinite loop.
     let suppressNextUpdate = false;
 
-    const sendContent = () => {
+    const sendContent = (diff?: DiffData) => {
       webviewPanel.webview.postMessage({
         type: 'update',
         text: document.getText(),
+        diff: diff ?? computeGitDiff(document.uri),
       });
     };
 
@@ -53,6 +68,10 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
           suppressNextUpdate = false;
           break;
         }
+
+        case 'reopen':
+          // Handled entirely in the webview (raw-mode toggle) — no-op here.
+          break;
       }
     });
 
@@ -66,15 +85,25 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
       }
     });
 
-    webviewPanel.onDidDispose(() => changeSubscription.dispose());
+    // Recompute diff on save so decorations reflect the committed baseline
+    const saveSubscription = vscode.workspace.onDidSaveTextDocument((saved) => {
+      if (saved.uri.toString() === document.uri.toString()) {
+        webviewPanel.webview.postMessage({
+          type: 'diff',
+          diff: computeGitDiff(document.uri),
+        });
+      }
+    });
+
+    webviewPanel.onDidDispose(() => {
+      changeSubscription.dispose();
+      saveSubscription.dispose();
+    });
   }
 
   private buildHtml(webview: vscode.Webview): string {
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'dist', 'webview.js')
-    );
-    const katexCssUri = webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'node_modules', 'katex', 'dist', 'katex.min.css')
     );
     const nonce = getNonce();
 
@@ -89,27 +118,142 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
              script-src 'nonce-${nonce}';" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>LaTeX Editor</title>
-  <link rel="stylesheet" href="${katexCssUri}" />
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     html, body {
       margin: 0; padding: 0;
       height: 100%; width: 100%;
+      display: flex; flex-direction: column;
       background: var(--vscode-editor-background);
       color: var(--vscode-editor-foreground);
+      overflow: hidden;
     }
-    #editor {
-      height: 100vh;
-      font-family: var(--vscode-editor-font-family, 'Courier New', monospace);
+    /* ── Toolbar ─────────────────────────────────────────── */
+    #toolbar {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 0 8px;
+      height: 34px;
+      background: var(--vscode-editor-background);
+      border-bottom: 1px solid var(--vscode-panel-border, #454545);
+      font-family: var(--vscode-font-family, sans-serif);
+      font-size: 12px;
+      user-select: none;
+    }
+    .tb-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 26px;
+      height: 22px;
+      padding: 0 6px;
+      border: 1px solid transparent;
+      border-radius: 3px;
+      background: transparent;
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+      white-space: nowrap;
+    }
+    .tb-btn:hover {
+      background: var(--vscode-toolbar-hoverBackground, rgba(90,93,94,0.31));
+      border-color: var(--vscode-toolbar-hoverOutline, transparent);
+    }
+    .tb-btn:active {
+      background: var(--vscode-toolbar-activeBackground, rgba(99,102,103,0.31));
+    }
+    .tb-btn-active {
+      background: var(--vscode-toolbar-activeBackground, rgba(99,102,103,0.31));
+      border-color: var(--vscode-focusBorder, #007fd4);
+    }
+    .tb-sep {
+      width: 1px;
+      height: 16px;
+      margin: 0 4px;
+      background: var(--vscode-panel-border, #454545);
+      flex-shrink: 0;
+    }
+    .tb-select {
+      height: 22px;
+      padding: 0 4px;
+      border: 1px solid var(--vscode-panel-border, #454545);
+      border-radius: 3px;
+      background: var(--vscode-dropdown-background, #3c3c3c);
+      color: var(--vscode-dropdown-foreground, #cccccc);
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      outline: none;
+    }
+    .tb-select:focus {
+      border-color: var(--vscode-focusBorder, #007fd4);
+    }
+    /* ── Editor area ─────────────────────────────────────── */
+    #editor, #raw-view {
+      flex: 1 1 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+    #raw-view {
+      display: none;
+    }
+    #raw-text {
+      width: 100%;
+      height: 100%;
+      resize: none;
+      border: none;
+      outline: none;
+      background: var(--vscode-editor-background);
+      color: var(--vscode-editor-foreground);
+      font-family: var(--vscode-editor-font-family, "Courier New", monospace);
       font-size: var(--vscode-editor-font-size, 14px);
+      line-height: 1.6;
+      padding: 16px;
+      box-sizing: border-box;
     }
-    /* Make CodeMirror fill the container */
     .cm-editor { height: 100%; }
     .cm-scroller { overflow: auto; }
   </style>
 </head>
 <body>
+  <div id="toolbar">
+    <button class="tb-btn" data-cmd="bold"      title="Bold (Ctrl+B)"><b>B</b></button>
+    <button class="tb-btn" data-cmd="italic"    title="Italic (Ctrl+I)"><i>I</i></button>
+    <button class="tb-btn" data-cmd="underline" title="Underline (Ctrl+U)" style="text-decoration:underline">U</button>
+    <button class="tb-btn" data-cmd="code"      title="Monospace / Code (Ctrl+Shift+M)" style="font-family:monospace">TT</button>
+    <button class="tb-btn" data-cmd="cite"      title="Cite (Ctrl+Shift+C)">Cite</button>
+    <div class="tb-sep"></div>
+    <select id="tb-font" class="tb-select" title="Font family">
+      <option value="">Default</option>
+      <option value="'Courier New', monospace">Courier New</option>
+      <option value="'Consolas', 'Monaco', 'Menlo', monospace">Consolas</option>
+      <option value="'Georgia', serif">Georgia</option>
+      <option value="'Times New Roman', Times, serif">Times New Roman</option>
+      <option value="'Arial', 'Helvetica Neue', sans-serif">Arial</option>
+    </select>
+    <select id="tb-size" class="tb-select" title="Font size" style="width:52px">
+      <option value="11">11px</option>
+      <option value="12">12px</option>
+      <option value="13">13px</option>
+      <option value="14" selected>14px</option>
+      <option value="16">16px</option>
+      <option value="18">18px</option>
+      <option value="20">20px</option>
+    </select>
+    <select id="tb-align" class="tb-select" title="Text alignment" style="width:72px">
+      <option value="left" selected>Left</option>
+      <option value="justify">Justify</option>
+    </select>
+    <div class="tb-sep"></div>
+    <button class="tb-btn" data-cmd="toggleDiff" title="Toggle diff decorations (off by default)">± Diff</button>
+    <div class="tb-sep"></div>
+    <button class="tb-btn" data-cmd="reopen"    title="Switch to plain text view">⊞ Text</button>
+  </div>
   <div id="editor"></div>
+  <div id="raw-view"><textarea id="raw-text" spellcheck="false"></textarea></div>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
@@ -121,4 +265,100 @@ function getNonce(): string {
   return Array.from({ length: 32 }, () =>
     chars[Math.floor(Math.random() * chars.length)]
   ).join('');
+}
+
+// ── Git diff helpers ──────────────────────────────────────────────────────────
+
+function computeGitDiff(docUri: vscode.Uri): DiffData {
+  const filePath = docUri.fsPath;
+  const dir = path.dirname(filePath);
+  const file = path.basename(filePath);
+  const result = spawnSync('git', ['diff', 'HEAD', '--word-diff=plain', '--', file], {
+    cwd: dir,
+    encoding: 'utf8',
+    timeout: 3000,
+  });
+  if (result.error || result.status !== 0 || !result.stdout) {
+    return { lines: [], deletions: [], inline: [] };
+  }
+  return parseDiff(result.stdout);
+}
+
+function parseDiff(diff: string): DiffData {
+  const lines: DiffLine[] = [];
+  const deletions: DiffDeleted[] = [];
+  const inline: InlineSpan[] = [];
+  let currentNewLine = 0;
+  let lastDeletionAfterLine = -1;
+
+  for (const raw of diff.split('\n')) {
+    if (raw.startsWith('@@')) {
+      const m = /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+      if (m) currentNewLine = parseInt(m[1], 10) - 1;
+    } else if (raw.startsWith('+') && !raw.startsWith('+++')) {
+      // Pure addition — entire line is new
+      currentNewLine++;
+      const content = raw.slice(1);
+      lines.push({ line: currentNewLine, type: 'added' });
+      if (content.length > 0) {
+        inline.push({ line: currentNewLine, from: 0, to: content.length, type: 'add' });
+      }
+    } else if (raw.startsWith('-') && !raw.startsWith('---')) {
+      // Pure deletion — line removed, show a red bar once per group
+      if (lastDeletionAfterLine !== currentNewLine) {
+        deletions.push({ afterLine: currentNewLine });
+        lastDeletionAfterLine = currentNewLine;
+      }
+    } else if (
+      raw.length > 0 &&
+      !raw.startsWith('\\') &&
+      !raw.startsWith('diff') &&
+      !raw.startsWith('index') &&
+      !raw.startsWith('---') &&
+      !raw.startsWith('+++')
+    ) {
+      // Context line (space prefix) — may carry inline word-diff markers
+      currentNewLine++;
+      const content = raw.startsWith(' ') ? raw.slice(1) : raw;
+      const hasMarkers = content.includes('[-') || content.includes('{+');
+      if (hasMarkers) {
+        lines.push({ line: currentNewLine, type: 'modified' });
+        parseWordDiffMarkers(content, currentNewLine, inline);
+      }
+    }
+  }
+
+  return { lines, deletions, inline };
+}
+
+/** Parse `[-deleted-]` and `{+added+}` markers from a word-diff context line.
+ *  Computes character offsets in the clean new-file text (markers removed). */
+function parseWordDiffMarkers(content: string, lineNum: number, inline: InlineSpan[]) {
+  let col = 0; // column in the clean new-file version of this line
+  let i = 0;
+
+  while (i < content.length) {
+    if (content[i] === '[' && content[i + 1] === '-') {
+      const end = content.indexOf('-]', i + 2);
+      if (end !== -1) {
+        const deleted = content.slice(i + 2, end);
+        // Insert a widget BEFORE col to show deleted text in red
+        inline.push({ line: lineNum, from: col, to: col, type: 'del', text: deleted });
+        i = end + 2;
+        continue;
+      }
+    }
+    if (content[i] === '{' && content[i + 1] === '+') {
+      const end = content.indexOf('+}', i + 2);
+      if (end !== -1) {
+        const added = content.slice(i + 2, end);
+        inline.push({ line: lineNum, from: col, to: col + added.length, type: 'add' });
+        col += added.length;
+        i = end + 2;
+        continue;
+      }
+    }
+    col++;
+    i++;
+  }
 }

@@ -2,20 +2,21 @@ import {
   Decoration,
   DecorationSet,
   EditorView,
-  ViewPlugin,
-  ViewUpdate,
   WidgetType,
 } from '@codemirror/view';
-import { RangeSetBuilder } from '@codemirror/state';
+import { RangeSetBuilder, StateField, EditorState } from '@codemirror/state';
 
 // ── Widgets ───────────────────────────────────────────────────────────────────
 
 /** Replaces figure/table environments with a visual preview of the caption. */
 class FigureWidget extends WidgetType {
   constructor(
+    readonly envFrom: number,
     readonly envType: 'figure' | 'table',
     readonly caption: string,
-    readonly label: string | null
+    readonly label: string | null,
+    readonly imagePath: string | null,
+    readonly docBaseUri: string,
   ) {
     super();
   }
@@ -23,15 +24,41 @@ class FigureWidget extends WidgetType {
   eq(other: FigureWidget): boolean {
     return (
       other instanceof FigureWidget &&
+      this.envFrom === other.envFrom &&
       this.envType === other.envType &&
       this.caption === other.caption &&
-      this.label === other.label
+      this.label === other.label &&
+      this.imagePath === other.imagePath &&
+      this.docBaseUri === other.docBaseUri
     );
   }
 
-  toDOM(): HTMLElement {
+  /** Suppress CM6's coordinate→position mapping for mouse events; we handle mousedown ourselves. */
+  ignoreEvent(event: Event): boolean {
+    return event instanceof MouseEvent;
+  }
+
+  toDOM(view: EditorView): HTMLElement {
     const div = document.createElement('div');
     div.className = `cm-latex-${this.envType}`;
+    div.style.cursor = 'text';
+    // Use mousedown (not click) — CM6 updates selection on mousedown, so we must
+    // intercept it before CM6 does. stopPropagation prevents the contentDOM handler
+    // from receiving it; preventDefault stops browser native cursor placement.
+    div.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      view.dispatch({ selection: { anchor: this.envFrom } });
+      view.focus();
+    });
+
+    // Image preview (figures only, not tables)
+    if (this.envType === 'figure' && this.imagePath && this.docBaseUri) {
+      div.appendChild(this.buildImagePreview());
+    }
+
+    const footer = document.createElement('div');
+    footer.className = `cm-latex-${this.envType}-footer`;
 
     const badge = document.createElement('span');
     badge.className = `cm-latex-${this.envType}-badge`;
@@ -48,14 +75,42 @@ class FigureWidget extends WidgetType {
       captionEl.appendChild(labelEl);
     }
 
-    div.appendChild(badge);
-    div.appendChild(captionEl);
+    footer.appendChild(badge);
+    footer.appendChild(captionEl);
+    div.appendChild(footer);
 
     return div;
   }
 
-  ignoreEvent(): boolean {
-    return false;
+  private buildImagePreview(): HTMLElement {
+    const container = document.createElement('div');
+    container.className = 'cm-latex-figure-img-container';
+
+    const img = document.createElement('img');
+    img.className = 'cm-latex-figure-img';
+    img.loading = 'lazy';
+    img.alt = this.caption || 'figure';
+
+    const base = this.docBaseUri.replace(/\/$/, '');
+    const hasExtension = /\.[a-zA-Z0-9]{2,4}$/.test(this.imagePath!);
+
+    if (hasExtension) {
+      img.src = `${base}/${this.imagePath}`;
+      img.onerror = () => { container.style.display = 'none'; };
+    } else {
+      // LaTeX searches common extensions; try in order
+      const exts = ['.png', '.jpg', '.jpeg', '.gif', '.svg'];
+      let idx = 0;
+      const tryNext = () => {
+        if (idx >= exts.length) { container.style.display = 'none'; return; }
+        img.src = `${base}/${this.imagePath}${exts[idx++]}`;
+      };
+      img.onerror = tryNext;
+      tryNext();
+    }
+
+    container.appendChild(img);
+    return container;
   }
 }
 
@@ -63,26 +118,33 @@ class FigureWidget extends WidgetType {
 
 interface FigureEnv {
   type: 'figure' | 'table';
-  from: number;      // start of \begin{…}
-  beginEnd: number;  // end of \begin{…}
-  endStart: number;  // start of \end{…}
-  to: number;        // end of \end{…}
-  caption: string;   // extracted caption text
-  label: string | null; // extracted label (if present)
+  from: number;
+  beginEnd: number;
+  endStart: number;
+  to: number;
+  caption: string;
+  label: string | null;
+  imagePath: string | null;
 }
 
 const BEGIN_RE = /\\begin\{(figure|table)\*?\}/g;
 
-/** Extract caption text from LaTeX. Handles nested braces. */
+/** Extract caption text from LaTeX. */
 function extractCaption(text: string): string {
-  const captionM = /\\caption\s*\{([^}]*)\}/.exec(text);
-  return captionM ? captionM[1].trim() : '';
+  const m = /\\caption\s*\{([^}]*)\}/.exec(text);
+  return m ? m[1].trim() : '';
 }
 
-/** Extract label (for cross-references). */
+/** Extract label for cross-references. */
 function extractLabel(text: string): string | null {
-  const labelM = /\\label\{([^}]+)\}/.exec(text);
-  return labelM ? labelM[1] : null;
+  const m = /\\label\{([^}]+)\}/.exec(text);
+  return m ? m[1] : null;
+}
+
+/** Extract the first \includegraphics path. */
+function extractIncludeGraphics(text: string): string | null {
+  const m = /\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/.exec(text);
+  return m ? m[1].trim() : null;
 }
 
 /** Scan the full document for figure and table environments. */
@@ -102,68 +164,59 @@ function scanFigures(text: string): FigureEnv[] {
     const to = endStart + endTag.length;
 
     const body = text.slice(beginEnd, endStart);
-    const caption = extractCaption(body);
-    const label = extractLabel(body);
-
-    envs.push({ type, from, beginEnd, endStart, to, caption, label });
+    envs.push({
+      type, from, beginEnd, endStart, to,
+      caption: extractCaption(body),
+      label: extractLabel(body),
+      imagePath: extractIncludeGraphics(body),
+    });
   }
 
   return envs;
 }
 
-// ── Builder ───────────────────────────────────────────────────────────────────
+// ── Builder + StateField factory ──────────────────────────────────────────────
 
-function buildFigureDecorations(view: EditorView): DecorationSet {
-  const docText = view.state.doc.toString();
-  const builder = new RangeSetBuilder<Decoration>();
+/**
+ * Factory function so the resolved document base URI (for loading images)
+ * is captured in the closure and available to the widget at render time.
+ * StateField is used (not ViewPlugin) because block-replace decorations that
+ * span line breaks are only permitted in StateField extensions.
+ */
+export function createFigureDecorations(docBaseUri: string) {
+  function build(state: EditorState): DecorationSet {
+    const docText = state.doc.toString();
+    const builder = new RangeSetBuilder<Decoration>();
+    const selRanges = state.selection.ranges;
 
-  for (const env of scanFigures(docText)) {
-    // Expand to raw when cursor is anywhere inside
-    const cursorInside = view.state.selection.ranges.some(
-      (sel) => sel.from <= env.to && sel.to >= env.from
-    );
-    if (cursorInside) continue;
+    for (const env of scanFigures(docText)) {
+      const cursorInside = selRanges.some(
+        (sel) => sel.from <= env.to && sel.to >= env.from
+      );
+      if (cursorInside) continue;
 
-    // Get line boundaries for hiding
-    const startLine = view.state.doc.lineAt(env.from);
-    const endLine = view.state.doc.lineAt(env.to - 1);
-
-    // Add widget at the start of the environment
-    builder.add(
-      env.from,
-      env.from,
-      Decoration.widget({
-        widget: new FigureWidget(env.type, env.caption, env.label),
-        side: -1,
-      })
-    );
-
-    // Hide all lines within the environment
-    for (let lineNum = startLine.number; lineNum <= endLine.number; lineNum++) {
-      const line = view.state.doc.line(lineNum);
-      builder.add(line.from, line.from, Decoration.line({ class: 'cm-latex-figure-hidden' }));
+      builder.add(
+        env.from,
+        env.to,
+        Decoration.replace({
+          widget: new FigureWidget(env.from, env.type, env.caption, env.label, env.imagePath, docBaseUri),
+          block: true,
+        })
+      );
     }
+
+    return builder.finish();
   }
 
-  return builder.finish();
+  return StateField.define<DecorationSet>({
+    create(state) { return build(state); },
+    update(decs, tr) {
+      if (tr.docChanged || tr.selection !== undefined) return build(tr.state);
+      return decs.map(tr.changes);
+    },
+    provide: (f) => EditorView.decorations.from(f),
+  });
 }
-
-// ── Plugin ────────────────────────────────────────────────────────────────────
-
-export const figureDecorations = ViewPlugin.fromClass(
-  class {
-    decorations: DecorationSet;
-    constructor(view: EditorView) {
-      this.decorations = buildFigureDecorations(view);
-    }
-    update(update: ViewUpdate) {
-      if (update.docChanged || update.selectionSet || update.viewportChanged) {
-        this.decorations = buildFigureDecorations(update.view);
-      }
-    }
-  },
-  { decorations: (v) => v.decorations }
-);
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
@@ -171,12 +224,13 @@ export const figureDecorationsTheme = EditorView.baseTheme({
   '.cm-latex-figure': {
     display: 'block',
     margin: '1em 0',
-    padding: '0.75em 1em',
+    padding: '0',
     backgroundColor: 'var(--vscode-badge-background, #007acc)',
     color: 'var(--vscode-badge-foreground, #ffffff)',
     borderRadius: '4px',
     fontSize: '0.95em',
     lineHeight: '1.5',
+    overflow: 'hidden',
   },
   '.cm-latex-table': {
     display: 'block',
@@ -187,6 +241,22 @@ export const figureDecorationsTheme = EditorView.baseTheme({
     borderRadius: '4px',
     fontSize: '0.95em',
     lineHeight: '1.5',
+  },
+  '.cm-latex-figure-img-container': {
+    textAlign: 'center',
+    backgroundColor: 'rgba(0,0,0,0.15)',
+    padding: '0.5em',
+  },
+  '.cm-latex-figure-img': {
+    maxHeight: '160px',
+    maxWidth: '100%',
+    objectFit: 'contain',
+    borderRadius: '2px',
+    display: 'block',
+    margin: '0 auto',
+  },
+  '.cm-latex-figure-footer, .cm-latex-table-footer': {
+    padding: '0.5em 1em',
   },
   '.cm-latex-figure-badge, .cm-latex-table-badge': {
     display: 'inline-block',
@@ -200,13 +270,5 @@ export const figureDecorationsTheme = EditorView.baseTheme({
     opacity: '0.85',
     fontStyle: 'italic',
     fontSize: '0.9em',
-  },
-  '.cm-latex-figure-hidden, .cm-latex-table-hidden': {
-    opacity: '0',
-    pointerEvents: 'none',
-    height: '0',
-    margin: '0',
-    padding: '0',
-    lineHeight: '0',
   },
 });
