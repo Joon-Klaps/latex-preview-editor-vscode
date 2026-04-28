@@ -1,0 +1,117 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{graphicx}
+
+\title{My First Document}
+\author{Jane Doe}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+% ── Introduction ──────────────────────────────────────────────────────────────
+
+\section{Introduction}
+
+Welcome to the \textbf{LaTeX Preview Editor}. This document exercises
+all currently supported decorations. Text can be \textit{italic},
+\textbf{bold}, \underline{underlined}, or in \texttt{monospace}.
+You can also \emph{emphasize} words for semantic meaning.
+
+Cross-references look like chips inline: see \ref{sec:math} for equations
+and \ref{sec:lists} for list examples. Citations render similarly:
+\cite{einstein1905} and \cite{dirac1930}.
+
+\label{sec:intro}
+
+% ── Mathematics ───────────────────────────────────────────────────────────────
+
+\section{Mathematics}
+\label{sec:math}
+
+Inline math: the energy $E = mc^2$ is famous, and so is Euler's
+identity $e^{i\pi} + 1 = 0$.
+
+A display equation using \verb|\[...\]|:
+
+\[
+  \int_0^\infty e^{-x^2} \, dx = \frac{\sqrt{\pi}}{2}
+\]
+
+A numbered equation:
+
+\begin{equation}
+  \nabla \cdot \mathbf{E} = \frac{\rho}{\varepsilon_0}
+  \label{eq:gauss}
+\end{equation}
+
+See \eqref{eq:gauss} for Gauss's law.  An aligned system:
+
+\begin{align}
+  f(x) &= x^2 + 2x + 1 \\
+       &= (x + 1)^2
+\end{align}
+
+% ── Lists ─────────────────────────────────────────────────────────────────────
+
+\section{Lists}
+\label{sec:lists}
+
+An unordered list:
+
+\begin{itemize}
+  \item First bullet point with some text
+  \item Second bullet, containing inline math $\alpha + \beta$
+  \item Third bullet point
+\end{itemize}
+
+A numbered list:
+
+\begin{enumerate}
+  \item Step one: set up the environment
+  \item Step two: write the content
+  \item Step three: compile and review
+\end{enumerate}
+
+% ── Figures and Tables ────────────────────────────────────────────────────────
+
+\section{Figures and Tables}
+\label{sec:figures}
+
+Here is an example figure environment:
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.5\textwidth]{example-image}
+  \caption{An example figure showing LaTeX rendering}
+  \label{fig:example}
+\end{figure}
+
+See Figure~\ref{fig:example} for details. Here is a table example:
+
+\begin{table}
+  \centering
+  \begin{tabular}{|c|c|c|}
+    \hline
+    Column 1 & Column 2 & Column 3 \\
+    \hline
+    Data 1 & Data 2 & Data 3 \\
+    \hline
+  \end{tabular}
+  \caption{A sample data table}
+  \label{tab:sample}
+\end{table}
+
+See Table~\ref{tab:sample} for the data.
+
+% ── URLs and footnotes ────────────────────────────────────────────────────────
+
+\section{Links and Footnotes}
+
+Visit \url{https://www.overleaf.com} for online LaTeX editing.
+This sentence has a footnote.\footnote{Footnotes appear inline as small
+dimmed text until you click on them.}
+
+\end{document}

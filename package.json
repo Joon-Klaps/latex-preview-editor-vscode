@@ -1,0 +1,39 @@
+{
+  "name": "latex-preview-editor",
+  "displayName": "LaTeX Preview Editor",
+  "description": "Overleaf-style hybrid WYSIWYG LaTeX editor",
+  "version": "0.0.1",
+  "publisher": "joon-klaps",
+  "engines": { "vscode": "^1.74.0" },
+  "categories": ["Other"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "latex-preview.editor",
+        "displayName": "LaTeX Preview Editor",
+        "selector": [{ "filenamePattern": "*.tex" }],
+        "priority": "default"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.74.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.0.0",
+    "@codemirror/language": "^6.0.0",
+    "@codemirror/legacy-modes": "^6.0.0",
+    "@codemirror/state": "^6.0.0",
+    "@codemirror/view": "^6.0.0",
+    "codemirror": "^6.0.0",
+    "katex": "^0.16.0"
+  }
+}
