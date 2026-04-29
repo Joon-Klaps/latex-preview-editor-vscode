@@ -3,7 +3,12 @@
   "displayName": "LaTeX Preview Editor",
   "description": "Overleaf-style hybrid WYSIWYG LaTeX editor",
   "version": "0.0.2",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joon-klaps/latex-preview-editor-vscode.git"
+  },
   "publisher": "joon-klaps",
+  "License": "MIT",
   "engines": { "vscode": "^1.74.0" },
   "categories": ["Other"],
   "main": "./dist/extension.js",
