@@ -11,6 +11,8 @@ A VS Code extension that replaces the default `.tex` file editor with a hybrid W
 - **Environment highlighting** — `\begin{...} ... \end{...}` blocks are visually grouped with subtle background highlights.
 - **LaTeX syntax highlighting** — full syntax colouring via CodeMirror's legacy `stex` mode.
 
+![alt text](assets/image.png)
+
 
 ## Installation
 

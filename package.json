@@ -2,7 +2,7 @@
   "name": "latex-preview-editor",
   "displayName": "LaTeX Preview Editor",
   "description": "Overleaf-style hybrid WYSIWYG LaTeX editor",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "joon-klaps",
   "engines": { "vscode": "^1.74.0" },
   "categories": ["Other"],

@@ -247,6 +247,13 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
       <option value="left" selected>Left</option>
       <option value="justify">Justify</option>
     </select>
+    <select id="tb-width" class="tb-select" title="Line width (max column width)" style="width:72px">
+      <option value="680px">680px</option>
+      <option value="780px" selected>780px</option>
+      <option value="960px">960px</option>
+      <option value="1200px">1200px</option>
+      <option value="100%">Full</option>
+    </select>
     <div class="tb-sep"></div>
     <button class="tb-btn" data-cmd="toggleDiff" title="Toggle diff decorations (off by default)">± Diff</button>
     <div class="tb-sep"></div>

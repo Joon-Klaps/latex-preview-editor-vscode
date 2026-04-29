@@ -96,6 +96,7 @@ const diffBtn = document.querySelector<HTMLElement>('[data-cmd="toggleDiff"]')!;
 let currentFont = '';   // '' = use VS Code default (CSS variable)
 let currentFontSize = 14;
 let currentAlign: 'left' | 'justify' = 'left';
+let currentMaxWidth = '780px';
 
 function applyEditorStyles() {
   const content = document.querySelector<HTMLElement>('.cm-content');
@@ -104,6 +105,7 @@ function applyEditorStyles() {
     content.style.fontSize = currentFont !== '' || currentFontSize !== 14
       ? currentFontSize + 'px' : '';
     content.style.textAlign = currentAlign;
+    content.style.maxWidth = currentMaxWidth;
     editor?.requestMeasure();
   }
   rawTextarea.style.fontFamily = currentFont;
@@ -121,6 +123,10 @@ function applyEditorStyles() {
 });
 (document.getElementById('tb-align') as HTMLSelectElement).addEventListener('change', (e) => {
   currentAlign = (e.target as HTMLSelectElement).value as 'left' | 'justify';
+  applyEditorStyles();
+});
+(document.getElementById('tb-width') as HTMLSelectElement).addEventListener('change', (e) => {
+  currentMaxWidth = (e.target as HTMLSelectElement).value;
   applyEditorStyles();
 });
 
