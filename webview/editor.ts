@@ -4,6 +4,10 @@ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { syntaxHighlighting, defaultHighlightStyle, StreamLanguage } from '@codemirror/language';
 import { stex } from '@codemirror/legacy-modes/mode/stex';
 import {
+  autocompletion, acceptCompletion,
+  type CompletionContext, type CompletionResult,
+} from '@codemirror/autocomplete';
+import {
   latexDecorations, latexDecorationsTheme,
   envDecorations, envDecorationsTheme,
   diffExtensions, setDiffData,
@@ -25,6 +29,48 @@ let editor: EditorView | null = null;
 let rawMode = false;
 let diffEnabled = false;
 let lastDiffData: DiffData = { lines: [], deletions: [], inline: [] };
+let citationKeys: string[] = [];
+let settingsContentWidth = '780px'; // tracks the last value from settings (not toolbar overrides)
+
+// ── Sync state (scroll + cursor sync with native split view) ──────────────────
+let splitViewEnabled = false;
+let syncScrollUntil = 0;    // timestamp until which CM scroll events are suppressed
+let nativeCursorIgnore = 0; // ignore CM cursor events while > 0 (programmatic move)
+let scrollSyncDebounce: ReturnType<typeof setTimeout> | null = null;
+let cursorSyncDebounce: ReturnType<typeof setTimeout> | null = null;
+
+// ── Citation autocomplete ────────────────────────────────────────────────────
+
+/** Matches \cite, \citet, \citep, \autocite, \parencite, etc. (with optional * and optional [...]) */
+const CITE_CONTEXT_RE = /\\[a-zA-Z]*cite[a-zA-Z]*\*?(?:\[[^\]]*\])?\{[^}]*/;
+
+function citationCompletionSource(ctx: CompletionContext): CompletionResult | null {
+  const match = ctx.matchBefore(CITE_CONTEXT_RE);
+  if (!match) return null;
+
+  const braceIdx = match.text.indexOf('{');
+  const insideBrace = match.text.slice(braceIdx + 1);
+  const lastComma = insideBrace.lastIndexOf(',');
+  const currentPartial = lastComma === -1
+    ? insideBrace
+    : insideBrace.slice(lastComma + 1).replace(/^\s+/, '');
+  const from = ctx.pos - currentPartial.length;
+
+  const lower = currentPartial.toLowerCase();
+  const prefix: string[] = [];
+  const contains: string[] = [];
+  for (const key of citationKeys) {
+    const k = key.toLowerCase();
+    if (k.startsWith(lower)) { prefix.push(key); }
+    else if (k.includes(lower)) { contains.push(key); }
+  }
+  const options = [...prefix, ...contains].map(label => ({ label, type: 'keyword' as const }));
+
+  // Only show dropdown if there are matches, or on an explicit trigger
+  if (options.length === 0 && !ctx.explicit) return null;
+
+  return { from, options };
+}
 
 // ── Formatting helper ────────────────────────────────────────────────────────
 
@@ -159,14 +205,16 @@ function createEditor(initialContent: string): void {
     extensions: [
       history(),
       keymap.of([
+        { key: 'Tab', run: acceptCompletion },
         { key: 'Mod-b', run: (v) => wrapSelection(v, '\\textbf{', '}') },
         { key: 'Mod-i', run: (v) => wrapSelection(v, '\\textit{', '}') },
         { key: 'Mod-u', run: (v) => wrapSelection(v, '\\underline{', '}') },
         { key: 'Mod-Shift-m', run: (v) => wrapSelection(v, '\\texttt{', '}') },
-        { key: 'Mod-Shift-c', run: (v) => wrapSelection(v, '\\cite{', '}') },
+        { key: 'Mod-Shift-r', run: (v) => wrapSelection(v, '\\cite{', '}') },
         ...defaultKeymap,
         ...historyKeymap,
       ]),
+      autocompletion({ override: [citationCompletionSource] }),
       // Diff gutter BEFORE lineNumbers so colour bar sits left of line numbers
       ...diffExtensions,
       lineNumbers(),
@@ -181,6 +229,15 @@ function createEditor(initialContent: string): void {
       EditorView.updateListener.of((update) => {
         if (update.docChanged) {
           sendEdit(update.state.doc.toString());
+        }
+        // Sync cursor to native editor on navigation (selection change without doc change)
+        if (update.selectionSet && !update.docChanged && splitViewEnabled && nativeCursorIgnore === 0) {
+          if (cursorSyncDebounce) { clearTimeout(cursorSyncDebounce); }
+          cursorSyncDebounce = setTimeout(() => {
+            if (!editor || !splitViewEnabled || nativeCursorIgnore > 0) { return; }
+            const line = editor.state.doc.lineAt(editor.state.selection.main.head).number;
+            vscode.postMessage({ type: 'cursorSync', line });
+          }, 50);
         }
       }),
       EditorView.theme({
@@ -220,6 +277,18 @@ function createEditor(initialContent: string): void {
   // Apply current view settings to the freshly-created editor
   applyEditorStyles();
 
+  // Attach scroll listener directly to the scroller element (scroll events don't bubble to root)
+  editor.scrollDOM.addEventListener('scroll', () => {
+    if (!splitViewEnabled || Date.now() < syncScrollUntil) { return; }
+    if (scrollSyncDebounce) { clearTimeout(scrollSyncDebounce); }
+    scrollSyncDebounce = setTimeout(() => {
+      if (!editor || !splitViewEnabled || Date.now() < syncScrollUntil) { return; }
+      const block = editor.lineBlockAtHeight(editor.scrollDOM.scrollTop);
+      const line = editor.state.doc.lineAt(block.from).number;
+      vscode.postMessage({ type: 'scrollSync', line });
+    }, 50);
+  });
+
   // ── Toolbar event delegation ───────────────────────────────────────────────
   document.getElementById('toolbar')!.addEventListener('click', (e) => {
     const btn = (e.target as Element).closest<HTMLElement>('[data-cmd]');
@@ -246,6 +315,25 @@ function createEditor(initialContent: string): void {
 
 window.addEventListener('message', (event: MessageEvent) => {
   const msg = event.data as { type: string; text?: string; diff?: DiffData };
+
+  if (msg.type === 'settingsUpdate') {
+    const s = (msg as { type: string; settings: { contentWidth: string; splitViewEnabled: boolean } }).settings;
+    splitViewEnabled = s.splitViewEnabled ?? false;
+    // Only apply contentWidth if the setting value itself changed (preserves toolbar per-session overrides)
+    if (s.contentWidth !== settingsContentWidth) {
+      settingsContentWidth = s.contentWidth;
+      currentMaxWidth = s.contentWidth;
+      const widthSel = document.getElementById('tb-width') as HTMLSelectElement | null;
+      if (widthSel) widthSel.value = s.contentWidth;
+      applyEditorStyles();
+    }
+    return;
+  }
+
+  if (msg.type === 'citations') {
+    citationKeys = (msg as { type: string; keys: string[] }).keys ?? [];
+    return;
+  }
 
   if (msg.type === 'update') {
     // Cache diff data — only apply to CM6 if the toggle is on
@@ -279,6 +367,29 @@ window.addEventListener('message', (event: MessageEvent) => {
     if (diffEnabled && editor) {
       editor.dispatch({ effects: setDiffData.of(lastDiffData) });
     }
+  }
+
+  if (msg.type === 'scrollSync') {
+    if (!editor || !splitViewEnabled) { return; }
+    const line = Math.max(1, Math.min((msg as { line: number }).line, editor.state.doc.lines));
+    const pos = editor.state.doc.line(line).from;
+    syncScrollUntil = Date.now() + 150;
+    editor.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'start' }) });
+    return;
+  }
+
+  if (msg.type === 'cursorSync') {
+    if (!editor || !splitViewEnabled) { return; }
+    const line = Math.max(1, Math.min((msg as { line: number }).line, editor.state.doc.lines));
+    const pos = editor.state.doc.line(line).from;
+    nativeCursorIgnore++;
+    syncScrollUntil = Date.now() + 150;
+    editor.dispatch({
+      selection: { anchor: pos, head: pos },
+      effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+    });
+    setTimeout(() => nativeCursorIgnore--, 300);
+    return;
   }
 });
 

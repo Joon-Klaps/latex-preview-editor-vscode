@@ -2,25 +2,67 @@
   "name": "latex-preview-editor",
   "displayName": "LaTeX Preview Editor",
   "description": "Overleaf-style hybrid WYSIWYG LaTeX editor",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "repository": {
     "type": "git",
     "url": "https://github.com/joon-klaps/latex-preview-editor-vscode.git"
   },
   "publisher": "joon-klaps",
   "License": "MIT",
-  "engines": { "vscode": "^1.74.0" },
-  "categories": ["Other"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "customEditors": [
       {
         "viewType": "latex-preview.editor",
         "displayName": "LaTeX Preview Editor",
-        "selector": [{ "filenamePattern": "*.tex" }],
+        "selector": [
+          {
+            "filenamePattern": "*.tex"
+          }
+        ],
         "priority": "default"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "latex-preview-sidebar",
+          "title": "LaTeX Preview",
+          "icon": "assets/sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "latex-preview-sidebar": [
+        {
+          "type": "webview",
+          "id": "latex-preview.settings",
+          "name": "LaTeX Preview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "LaTeX Preview Editor",
+      "properties": {
+        "latex-preview-editor.splitViewEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, opens a native VS Code text editor alongside the WYSIWYG view (Copilot and IntelliSense work in the native editor)."
+        },
+        "latex-preview-editor.contentWidth": {
+          "type": "string",
+          "default": "780px",
+          "enum": ["680px", "780px", "960px", "1200px", "100%"],
+          "description": "Default editor content width."
+        }
+      }
+    }
   },
   "scripts": {
     "build": "node build.mjs",
@@ -28,11 +70,12 @@
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
-    "@types/vscode": "^1.74.0",
+    "@types/vscode": "^1.116.0",
     "esbuild": "^0.20.0",
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.1",
     "@codemirror/commands": "^6.0.0",
     "@codemirror/language": "^6.0.0",
     "@codemirror/legacy-modes": "^6.0.0",

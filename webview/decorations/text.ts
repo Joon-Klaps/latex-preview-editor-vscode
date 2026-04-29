@@ -99,11 +99,11 @@ function buildDecorations(view: EditorView): DecorationSet {
       const cls = CMD_CLASS[m[1]];
       if (!cls) continue;
 
-      collected.push({ from: cmdFrom, to: prefixTo, dec: HIDE });
       if (prefixTo < contentTo) {
+        collected.push({ from: cmdFrom, to: prefixTo, dec: HIDE });
         collected.push({ from: prefixTo, to: contentTo, dec: Decoration.mark({ class: cls }) });
+        collected.push({ from: contentTo, to: cmdTo, dec: HIDE });
       }
-      collected.push({ from: contentTo, to: cmdTo, dec: HIDE });
     }
   }
 

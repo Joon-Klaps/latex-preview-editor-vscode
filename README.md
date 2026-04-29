@@ -26,7 +26,7 @@ npm run build
 ```bash
 npm install -g @vscode/vsce
 vsce package
-code --install-extension latex-preview-editor-0.0.1.vsix
+code --install-extension latex-preview-editor-*.vsix
 ```
 
 
@@ -39,7 +39,7 @@ All controls live in a persistent header bar that stays visible in every mode:
 | *I* | Wrap selection in `\textit{}` · `Ctrl/Cmd+I` |
 | <u>U</u> | Wrap selection in `\underline{}` · `Ctrl/Cmd+U` |
 | `TT` | Wrap selection in `\texttt{}` · `Ctrl/Cmd+Shift+M` |
-| Cite | Wrap selection in `\cite{}` · `Ctrl/Cmd+Shift+C` |
+| Cite | Wrap selection in `\cite{}` · `Ctrl/Cmd+Shift+R` |
 | **Font ▾** | Switch editor font (Default / Courier New / Consolas / Georgia / Times New Roman / Arial) |
 | **Size ▾** | Change font size (11 – 20 px) |
 | **Align ▾** | Left or Justified text alignment |

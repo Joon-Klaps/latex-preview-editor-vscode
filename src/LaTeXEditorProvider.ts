@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { spawnSync } from 'child_process';
 import * as path from 'path';
+import * as fs from 'fs';
+import { getSettings } from './settings';
 
 // ── Diff types (mirrored from webview/decorations/diff.ts) ───────────────────
 
@@ -38,6 +40,88 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     // so we don't echo it back and cause an infinite loop.
     let suppressNextUpdate = false;
 
+    // ── Split view ─────────────────────────────────────────────────────────────
+    // Tracks whether THIS panel was responsible for opening the native split tab.
+    let didOpenNativeSplit = false;
+
+    // Loop-prevention counters / debounce timers for scroll + cursor sync
+    let nativeSyncScrollIgnore = 0;
+    let nativeScrollDebounce: ReturnType<typeof setTimeout> | null = null;
+    let lastSentScrollLine = -1;
+
+    /** Returns the first visible native TextEditor for this document, if any. */
+    const getNativeEditor = (): vscode.TextEditor | undefined =>
+      vscode.window.visibleTextEditors.find(
+        e => e.document.uri.toString() === document.uri.toString()
+      );
+
+    /** Opens the file in a native VS Code text editor to the side (if not already open). */
+    const openNativeSplit = async () => {
+      const uriStr = document.uri.toString();
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          if (tab.input instanceof vscode.TabInputText &&
+              tab.input.uri.toString() === uriStr) {
+            return; // A native text tab for this file already exists — don't duplicate
+          }
+        }
+      }
+      await vscode.window.showTextDocument(document, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preview: false,
+        preserveFocus: true,
+      });
+      didOpenNativeSplit = true;
+    };
+
+    /** Closes the native split tab — only if this panel opened it. */
+    const closeNativeSplit = async () => {
+      if (!didOpenNativeSplit) { return; }
+      didOpenNativeSplit = false;
+      const uriStr = document.uri.toString();
+      for (const group of vscode.window.tabGroups.all) {
+        for (const tab of group.tabs) {
+          if (tab.input instanceof vscode.TabInputText &&
+              tab.input.uri.toString() === uriStr) {
+            await vscode.window.tabGroups.close(tab);
+            return;
+          }
+        }
+      }
+    };
+
+    const sendCitations = async () => {
+      const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+      const pattern = workspaceFolder
+        ? new vscode.RelativePattern(workspaceFolder, '**/*.bib')
+        : '**/*.bib';
+      const bibFiles = await vscode.workspace.findFiles(pattern);
+      const keys: string[] = [];
+      for (const uri of bibFiles) {
+        try {
+          const content = fs.readFileSync(uri.fsPath, 'utf8');
+          keys.push(...parseBibKeys(content));
+        } catch { /* skip unreadable files */ }
+      }
+      const unique = [...new Set(keys)].sort();
+      webviewPanel.webview.postMessage({ type: 'citations', keys: unique });
+    };
+
+    // Debounced watcher for .bib file changes
+    let bibDebounce: ReturnType<typeof setTimeout> | null = null;
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+    const watchPattern = workspaceFolder
+      ? new vscode.RelativePattern(workspaceFolder, '**/*.bib')
+      : '**/*.bib';
+    const bibWatcher = vscode.workspace.createFileSystemWatcher(watchPattern);
+    const onBibChange = () => {
+      if (bibDebounce) clearTimeout(bibDebounce);
+      bibDebounce = setTimeout(() => sendCitations(), 500);
+    };
+    bibWatcher.onDidChange(onBibChange);
+    bibWatcher.onDidCreate(onBibChange);
+    bibWatcher.onDidDelete(onBibChange);
+
     const sendContent = (diff?: DiffData) => {
       webviewPanel.webview.postMessage({
         type: 'update',
@@ -51,6 +135,9 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
       switch (msg.type) {
         case 'ready':
           sendContent();
+          sendCitations();
+          webviewPanel.webview.postMessage({ type: 'settingsUpdate', settings: getSettings() });
+          if (getSettings().splitViewEnabled) { openNativeSplit(); }
           break;
 
         case 'edit': {
@@ -72,6 +159,33 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
         case 'reopen':
           // Handled entirely in the webview (raw-mode toggle) — no-op here.
           break;
+
+        case 'scrollSync': {
+          if (!getSettings().splitViewEnabled || nativeSyncScrollIgnore > 0) { break; }
+          const ne = getNativeEditor();
+          if (!ne) { break; }
+          const rawLine = (msg as { line: number }).line;
+          const line = Math.max(0, Math.min(rawLine - 1, document.lineCount - 1));
+          const pos = new vscode.Position(line, 0);
+          nativeSyncScrollIgnore++;
+          ne.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.AtTop);
+          setTimeout(() => nativeSyncScrollIgnore--, 300);
+          break;
+        }
+
+        case 'cursorSync': {
+          if (!getSettings().splitViewEnabled) { break; }
+          const ne = getNativeEditor();
+          if (!ne) { break; }
+          const rawLine = (msg as { line: number }).line;
+          const line = Math.max(0, Math.min(rawLine - 1, document.lineCount - 1));
+          const pos = new vscode.Position(line, 0);
+          ne.selection = new vscode.Selection(pos, pos);
+          nativeSyncScrollIgnore++;
+          ne.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+          setTimeout(() => nativeSyncScrollIgnore--, 300);
+          break;
+        }
       }
     });
 
@@ -95,9 +209,57 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
       }
     });
 
+    // Propagate settings changes (from sidebar or settings.json) to this panel
+    let prevSplitViewEnabled = getSettings().splitViewEnabled;
+    const configSubscription = vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration('latex-preview-editor')) {
+        const settings = getSettings();
+        webviewPanel.webview.postMessage({ type: 'settingsUpdate', settings });
+        if (settings.splitViewEnabled && !prevSplitViewEnabled) {
+          openNativeSplit();
+        } else if (!settings.splitViewEnabled && prevSplitViewEnabled) {
+          closeNativeSplit();
+        }
+        prevSplitViewEnabled = settings.splitViewEnabled;
+      }
+    });
+
+    // ── Native → webview scroll sync ──────────────────────────────────────────
+    const visibleRangesSubscription = vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
+      if (!getSettings().splitViewEnabled) { return; }
+      if (e.textEditor.document.uri.toString() !== document.uri.toString()) { return; }
+      if (nativeSyncScrollIgnore > 0) { return; }
+      const topLine = (e.visibleRanges[0]?.start.line ?? 0) + 1; // 1-based
+      if (topLine === lastSentScrollLine) { return; }
+      if (nativeScrollDebounce) { clearTimeout(nativeScrollDebounce); }
+      nativeScrollDebounce = setTimeout(() => {
+        if (nativeSyncScrollIgnore > 0) { return; }
+        lastSentScrollLine = topLine;
+        webviewPanel.webview.postMessage({ type: 'scrollSync', line: topLine });
+      }, 30);
+    });
+
+    // ── Native → webview cursor sync ──────────────────────────────────────────
+    const selectionSubscription = vscode.window.onDidChangeTextEditorSelection((e) => {
+      if (!getSettings().splitViewEnabled) { return; }
+      if (e.textEditor.document.uri.toString() !== document.uri.toString()) { return; }
+      // Only sync user-initiated movements (Keyboard/Mouse), not programmatic ones
+      if (e.kind !== vscode.TextEditorSelectionChangeKind.Keyboard &&
+          e.kind !== vscode.TextEditorSelectionChangeKind.Mouse) { return; }
+      const line = e.selections[0].active.line + 1; // 1-based
+      // Suppress the visible-range change that follows cursor movement
+      nativeSyncScrollIgnore++;
+      setTimeout(() => nativeSyncScrollIgnore--, 200);
+      webviewPanel.webview.postMessage({ type: 'cursorSync', line });
+    });
+
     webviewPanel.onDidDispose(() => {
       changeSubscription.dispose();
       saveSubscription.dispose();
+      configSubscription.dispose();
+      visibleRangesSubscription.dispose();
+      selectionSubscription.dispose();
+      bibWatcher.dispose();
     });
   }
 
@@ -272,6 +434,22 @@ function getNonce(): string {
   return Array.from({ length: 32 }, () =>
     chars[Math.floor(Math.random() * chars.length)]
   ).join('');
+}
+
+// ── BibTeX helpers ────────────────────────────────────────────────────────────
+
+/** Extract citation keys from a BibTeX file, skipping non-entry types. */
+function parseBibKeys(content: string): string[] {
+  const NON_KEY_TYPES = new Set(['string', 'preamble', 'comment']);
+  const keys: string[] = [];
+  const re = /@(\w+)\s*\{\s*([^,\s{]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    if (!NON_KEY_TYPES.has(m[1].toLowerCase())) {
+      keys.push(m[2]);
+    }
+  }
+  return keys;
 }
 
 // ── Git diff helpers ──────────────────────────────────────────────────────────
