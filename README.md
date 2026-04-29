@@ -11,6 +11,23 @@ A VS Code extension that replaces the default `.tex` file editor with a hybrid W
 - **Environment highlighting** — `\begin{...} ... \end{...}` blocks are visually grouped with subtle background highlights.
 - **LaTeX syntax highlighting** — full syntax colouring via CodeMirror's legacy `stex` mode.
 
+
+## Installation
+
+```
+git clone https://github.com/joon-klaps/latex-preview-editor-vscode.git
+cd latex-preview-editor-vscode
+npm install
+npm run build
+```
+
+```bash
+npm install -g @vscode/vsce
+vsce package
+code --install-extension latex-preview-editor-0.0.1.vsix
+```
+
+
 ### Toolbar
 All controls live in a persistent header bar that stays visible in every mode:
 
@@ -51,7 +68,7 @@ Click **⊞ Text** in the toolbar to switch to a plain `<textarea>` showing the 
 
 ## Getting Started
 
-1. Install the extension (see [install options](./publish.md)).
+1. Install the extension
 2. Open any `.tex` file — the LaTeX Preview Editor opens automatically as the default editor.
 3. Right-click the file tab → **Reopen Editor With…** → **Text Editor** if you ever need VS Code's stock editor.
 
