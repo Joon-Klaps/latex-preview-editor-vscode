@@ -434,8 +434,11 @@ async function fetchOllamaCompletion(
   }
   const currentEnv = envStack.at(-1) ?? null;
 
-  const trimmedPrefix = strippedPrefix.slice(-900);
-  const trimmedSuffix = suffix.slice(0, 300);
+  // Keep only local context — the preamble and distant sections poison both FIM and chat models.
+  const trimmedPrefix = strippedPrefix.slice(-400);
+  // Trim suffix at the first paragraph boundary so structural LaTeX (\label, \section, math
+  // environments) that follows the cursor doesn't leak in and confuse the model.
+  const trimmedSuffix = suffix.split('\n\n')[0].slice(0, 200);
 
   const format = resolveFimFormat(ollamaModel, fimFormatOverride);
 
@@ -446,33 +449,23 @@ async function fetchOllamaCompletion(
   let res: Response;
   try {
     if (format === 'chat') {
-      // 1. Rely on your existing envStack for block environments
       const MATH_ENVS = new Set(['equation', 'align', 'align*', 'math', 'gather', 'gather*', 'multline', 'multline*', 'displaymath']);
       const inMathBlockEnv = MATH_ENVS.has(currentEnv ?? '');
-
-      // 2. Check for unclosed \[ or \(
-      // The negative lookahead (?![^]*\\[\])]) ensures no closing tag exists after the opening tag
       const hasUnclosedBracketMath = /\\[\[(](?![^]*\\[\])])[^]*$/.test(prefix);
-
-      // 3. Count unescaped $ signs, but ONLY in the current paragraph!
-      // This prevents earlier text or comments from permanently breaking the odd/even count.
       const currentParagraph = prefix.split('\n\n').pop() ?? '';
       const unescapedDollars = (currentParagraph.replace(/\\\$/g, '').match(/\$/g) || []).length;
-      const hasOddDollars = unescapedDollars % 2 === 1;
+      const inMathMode = inMathBlockEnv || hasUnclosedBracketMath || (unescapedDollars % 2 === 1);
 
-      const inMathMode = inMathBlockEnv || hasUnclosedBracketMath || hasOddDollars;
-      const contextNotes = [
-        inMathMode && 'Cursor is inside math mode.',
-        currentEnv && `Innermost open environment: \\begin{${currentEnv}} — do NOT emit \\end{${currentEnv}}.`,
-      ].filter(Boolean).join('\n');
-
-      const systemPrompt = [
-        'You are a LaTeX fill-in-the-middle (FIM) autocomplete engine.',
-        'Output ONLY the raw LaTeX completion text — no prose, no markdown fences.',
-        '1. ONE logical unit: a single command, phrase, expression, or sentence.',
-        '2. Never repeat text already in prefix or suffix.',
-        '3. Never close an environment you did not open.',
-      ].join('\n');
+      // Use <CURSOR> marker — far clearer than PREFIX/SUFFIX/Completion framing for chat models.
+      // Small models trained for chat ignore the suffix constraint when shown that format;
+      // placing the marker inline forces them to generate exactly what belongs at that point.
+      const systemLines = [
+        'You are a LaTeX autocomplete engine.',
+        'The text below contains the marker <CURSOR>. Output ONLY the LaTeX text to insert at <CURSOR>.',
+        'Rules: one phrase, sentence, or command; no prose explanation; no markdown fences; never close an environment you did not open.',
+      ];
+      if (inMathMode) { systemLines.push('You are inside math mode.'); }
+      if (currentEnv) { systemLines.push(`Innermost open environment: \\begin{${currentEnv}} — do NOT emit \\end{${currentEnv}}.`); }
 
       res = await fetch(`${ollamaUrl}/api/chat`, {
         method: 'POST',
@@ -480,12 +473,8 @@ async function fetchOllamaCompletion(
         body: JSON.stringify({
           model: ollamaModel,
           messages: [
-            { role: 'system', content: systemPrompt },
-            {
-              role: 'user',
-              content: (contextNotes ? `Context:\n${contextNotes}\n\n` : '') +
-                `PREFIX:\n${trimmedPrefix}\n\nSUFFIX:\n${trimmedSuffix}\n\nCompletion:`,
-            },
+            { role: 'system', content: systemLines.join('\n') },
+            { role: 'user', content: `${trimmedPrefix}<CURSOR>${trimmedSuffix}` },
           ],
           stream: false,
           options: { temperature: 0.05, num_predict: maxTokens },
@@ -532,14 +521,40 @@ async function fetchOllamaCompletion(
   fimLog.appendLine(`[FIM] rawPrediction=${JSON.stringify(rawPrediction)}`);
 
   let prediction = rawPrediction.trimEnd();
+
+  // Strip markdown code fences that chat models sometimes emit.
   prediction = prediction.replace(/```[\w]*\n?/g, '').trimEnd();
 
+  // Truncate at the first FIM special token the model may echo back.
+  // Everything from the first <fim_*>, <|fim_*|>, <PRE>/<MID>/<EOT>, or deepseek
+  // unicode variants onwards is garbage — the useful completion is before it.
+  const FIM_TOKEN_RE = /<(?:\/?fim_\w+|PRE|SUF|MID|EOT)>|<[|｜](?:fim_\w+|endoftext)[|｜]>/;
+  const specialIdx = prediction.search(FIM_TOKEN_RE);
+  if (specialIdx === 0) {
+    fimLog.appendLine('[FIM] → empty: prediction starts with FIM token');
+    return '';
+  }
+  if (specialIdx > 0) {
+    fimLog.appendLine(`[FIM] truncated at FIM token, was=${JSON.stringify(prediction)}`);
+    prediction = prediction.slice(0, specialIdx).trimEnd();
+  }
+
   if (!MULTILINE_ENVS.has(currentEnv ?? '')) {
-    const beforeSplit = prediction;
-    prediction = prediction.split('\n\n')[0];
-    if (prediction !== beforeSplit) {
-      fimLog.appendLine(`[FIM] trimmed at \\n\\n, was=${JSON.stringify(beforeSplit)}`);
+    const before = prediction;
+    // If the cursor is mid-line (prefix doesn't end with a newline), only a single-line
+    // completion makes sense. Trim at the first \n to discard code/prose that spills over.
+    const cursorMidLine = !trimmedPrefix.endsWith('\n') && trimmedPrefix !== '';
+    prediction = cursorMidLine ? prediction.split('\n')[0] : prediction.split('\n\n')[0];
+    if (prediction !== before) {
+      fimLog.appendLine(`[FIM] trimmed at ${cursorMidLine ? '\\n' : '\\n\\n'}, was=${JSON.stringify(before)}`);
     }
+  }
+
+  // Reject block-level LaTeX commands when the cursor is mid-line — they are never valid there.
+  const cursorMidLine = !trimmedPrefix.endsWith('\n') && trimmedPrefix !== '';
+  if (cursorMidLine && /^\s*\\(?:section|chapter|subsection|subsubsection|paragraph|begin|end|label|vspace|hspace|newpage|clearpage|par)\b/.test(prediction)) {
+    fimLog.appendLine('[FIM] → rejected: block command inserted mid-line');
+    return '';
   }
 
   const trimmed = prediction.trim();
