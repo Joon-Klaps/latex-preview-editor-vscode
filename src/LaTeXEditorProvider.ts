@@ -417,7 +417,7 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
       <option value="100%">Full</option>
     </select>
     <div class="tb-sep"></div>
-    <button class="tb-btn" data-cmd="toggleDiff" title="Toggle diff decorations (off by default)">± Diff</button>
+    <button class="tb-btn tb-btn-active" data-cmd="toggleDiff" title="Toggle diff decorations (on by default)">± Diff</button>
     <div class="tb-sep"></div>
     <button class="tb-btn" data-cmd="reopen"    title="Switch to plain text view">⊞ Text</button>
   </div>

@@ -27,7 +27,7 @@ const vscode = acquireVsCodeApi();
 
 let editor: EditorView | null = null;
 let rawMode = false;
-let diffEnabled = false;
+let diffEnabled = true;
 let lastDiffData: DiffData = { lines: [], deletions: [], inline: [] };
 let citationKeys: string[] = [];
 let settingsContentWidth = '780px'; // tracks the last value from settings (not toolbar overrides)
