@@ -2,7 +2,9 @@ import * as vscode from 'vscode';
 import { spawnSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getSettings } from './settings';
+import { getSettings, type FimFormat } from './settings';
+
+const fimLog = vscode.window.createOutputChannel('LaTeX Preview – FIM');
 
 export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
   public static readonly viewType = 'latex-preview.editor';
@@ -25,57 +27,7 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
 
     // Track whether the current document change originated from the webview,
     // so we don't echo it back and cause an infinite loop.
-    let suppressNextUpdate = false;
-
-    // ── Split view ─────────────────────────────────────────────────────────────
-    // Tracks whether THIS panel was responsible for opening the native split tab.
-    let didOpenNativeSplit = false;
-
-    // Loop-prevention counters / debounce timers for scroll + cursor sync
-    let nativeSyncScrollIgnore = 0;
-    let nativeScrollDebounce: ReturnType<typeof setTimeout> | null = null;
-    let lastSentScrollLine = -1;
-
-    /** Returns the first visible native TextEditor for this document, if any. */
-    const getNativeEditor = (): vscode.TextEditor | undefined =>
-      vscode.window.visibleTextEditors.find(
-        e => e.document.uri.toString() === document.uri.toString()
-      );
-
-    /** Opens the file in a native VS Code text editor to the side (if not already open). */
-    const openNativeSplit = async () => {
-      const uriStr = document.uri.toString();
-      for (const group of vscode.window.tabGroups.all) {
-        for (const tab of group.tabs) {
-          if (tab.input instanceof vscode.TabInputText &&
-              tab.input.uri.toString() === uriStr) {
-            return; // A native text tab for this file already exists — don't duplicate
-          }
-        }
-      }
-      await vscode.window.showTextDocument(document, {
-        viewColumn: vscode.ViewColumn.Beside,
-        preview: false,
-        preserveFocus: true,
-      });
-      didOpenNativeSplit = true;
-    };
-
-    /** Closes the native split tab — only if this panel opened it. */
-    const closeNativeSplit = async () => {
-      if (!didOpenNativeSplit) { return; }
-      didOpenNativeSplit = false;
-      const uriStr = document.uri.toString();
-      for (const group of vscode.window.tabGroups.all) {
-        for (const tab of group.tabs) {
-          if (tab.input instanceof vscode.TabInputText &&
-              tab.input.uri.toString() === uriStr) {
-            await vscode.window.tabGroups.close(tab);
-            return;
-          }
-        }
-      }
-    };
+    let suppressUpdateCount = 0;
 
     const sendCitations = async () => {
       const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
@@ -124,11 +76,10 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
           sendContent();
           sendCitations();
           webviewPanel.webview.postMessage({ type: 'settingsUpdate', settings: getSettings() });
-          if (getSettings().splitViewEnabled) { openNativeSplit(); }
           break;
 
         case 'edit': {
-          suppressNextUpdate = true;
+          suppressUpdateCount++;
           const edit = new vscode.WorkspaceEdit();
           edit.replace(
             document.uri,
@@ -139,7 +90,7 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
             msg.text
           );
           await vscode.workspace.applyEdit(edit);
-          suppressNextUpdate = false;
+          suppressUpdateCount--;
           break;
         }
 
@@ -147,30 +98,20 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
           // Handled entirely in the webview (raw-mode toggle) — no-op here.
           break;
 
-        case 'scrollSync': {
-          if (!getSettings().splitViewEnabled || nativeSyncScrollIgnore > 0) { break; }
-          const ne = getNativeEditor();
-          if (!ne) { break; }
-          const rawLine = (msg as { line: number }).line;
-          const line = Math.max(0, Math.min(rawLine - 1, document.lineCount - 1));
-          const pos = new vscode.Position(line, 0);
-          nativeSyncScrollIgnore++;
-          ne.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.AtTop);
-          setTimeout(() => nativeSyncScrollIgnore--, 300);
-          break;
-        }
-
-        case 'cursorSync': {
-          if (!getSettings().splitViewEnabled) { break; }
-          const ne = getNativeEditor();
-          if (!ne) { break; }
-          const rawLine = (msg as { line: number }).line;
-          const line = Math.max(0, Math.min(rawLine - 1, document.lineCount - 1));
-          const pos = new vscode.Position(line, 0);
-          ne.selection = new vscode.Selection(pos, pos);
-          nativeSyncScrollIgnore++;
-          ne.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-          setTimeout(() => nativeSyncScrollIgnore--, 300);
+        case 'complete': {
+          const { id, prefix, suffix } = msg as { type: string; id: string; prefix: string; suffix: string };
+          fimLog.show(true);
+          fimLog.appendLine(`[FIM] complete message received id=${id.slice(0, 6)}`);
+          let prediction = '';
+          try {
+            const { ollamaUrl, ollamaModel, ollamaMaxTokens, ollamaFimFormat } = getSettings();
+            fimLog.appendLine(`ollamaUrl=${ollamaUrl}, ollamaModel=${ollamaModel}, ollamaMaxTokens=${ollamaMaxTokens}, ollamaFimFormat=${ollamaFimFormat}`);
+            prediction = await fetchOllamaCompletion(prefix, suffix, ollamaUrl, ollamaModel, ollamaMaxTokens, ollamaFimFormat);
+          } catch (e) {
+            fimLog.appendLine(`[FIM] outer catch: ${e}`);
+          }
+          fimLog.appendLine(`[FIM] sending prediction=${JSON.stringify(prediction)}`);
+          webviewPanel.webview.postMessage({ type: 'completion', id, prediction });
           break;
         }
       }
@@ -180,7 +121,7 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     const changeSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
       if (
         e.document.uri.toString() === document.uri.toString() &&
-        !suppressNextUpdate
+        suppressUpdateCount === 0
       ) {
         sendContent();
       }
@@ -197,55 +138,16 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     });
 
     // Propagate settings changes (from sidebar or settings.json) to this panel
-    let prevSplitViewEnabled = getSettings().splitViewEnabled;
     const configSubscription = vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('latex-preview-editor')) {
-        const settings = getSettings();
-        webviewPanel.webview.postMessage({ type: 'settingsUpdate', settings });
-        if (settings.splitViewEnabled && !prevSplitViewEnabled) {
-          openNativeSplit();
-        } else if (!settings.splitViewEnabled && prevSplitViewEnabled) {
-          closeNativeSplit();
-        }
-        prevSplitViewEnabled = settings.splitViewEnabled;
+        webviewPanel.webview.postMessage({ type: 'settingsUpdate', settings: getSettings() });
       }
-    });
-
-    // ── Native → webview scroll sync ──────────────────────────────────────────
-    const visibleRangesSubscription = vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
-      if (!getSettings().splitViewEnabled) { return; }
-      if (e.textEditor.document.uri.toString() !== document.uri.toString()) { return; }
-      if (nativeSyncScrollIgnore > 0) { return; }
-      const topLine = (e.visibleRanges[0]?.start.line ?? 0) + 1; // 1-based
-      if (topLine === lastSentScrollLine) { return; }
-      if (nativeScrollDebounce) { clearTimeout(nativeScrollDebounce); }
-      nativeScrollDebounce = setTimeout(() => {
-        if (nativeSyncScrollIgnore > 0) { return; }
-        lastSentScrollLine = topLine;
-        webviewPanel.webview.postMessage({ type: 'scrollSync', line: topLine });
-      }, 30);
-    });
-
-    // ── Native → webview cursor sync ──────────────────────────────────────────
-    const selectionSubscription = vscode.window.onDidChangeTextEditorSelection((e) => {
-      if (!getSettings().splitViewEnabled) { return; }
-      if (e.textEditor.document.uri.toString() !== document.uri.toString()) { return; }
-      // Only sync user-initiated movements (Keyboard/Mouse), not programmatic ones
-      if (e.kind !== vscode.TextEditorSelectionChangeKind.Keyboard &&
-          e.kind !== vscode.TextEditorSelectionChangeKind.Mouse) { return; }
-      const line = e.selections[0].active.line + 1; // 1-based
-      // Suppress the visible-range change that follows cursor movement
-      nativeSyncScrollIgnore++;
-      setTimeout(() => nativeSyncScrollIgnore--, 200);
-      webviewPanel.webview.postMessage({ type: 'cursorSync', line });
     });
 
     webviewPanel.onDidDispose(() => {
       changeSubscription.dispose();
       saveSubscription.dispose();
       configSubscription.dispose();
-      visibleRangesSubscription.dispose();
-      selectionSubscription.dispose();
       bibWatcher.dispose();
     });
   }
@@ -340,6 +242,14 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     .tb-select:focus {
       border-color: var(--vscode-focusBorder, #007fd4);
     }
+    #fim-status {
+      margin-left: auto;
+      font-size: 14px;
+      line-height: 1;
+      display: none;
+      animation: fim-spin 1s linear infinite;
+    }
+    @keyframes fim-spin { to { transform: rotate(360deg); } }
     /* ── Editor area ─────────────────────────────────────── */
     #editor, #raw-view {
       flex: 1 1 0;
@@ -407,6 +317,7 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     <button class="tb-btn tb-btn-active" data-cmd="toggleDiff" title="Toggle diff decorations (on by default)">± Diff</button>
     <div class="tb-sep"></div>
     <button class="tb-btn" data-cmd="reopen"    title="Switch to plain text view">⊞ Text</button>
+    <span id="fim-status" title="Ollama generating…">⚙</span>
   </div>
   <div id="editor"></div>
   <div id="raw-view"><textarea id="raw-text" spellcheck="false"></textarea></div>
@@ -437,6 +348,208 @@ function parseBibKeys(content: string): string[] {
     }
   }
   return keys;
+}
+
+// ── Ollama FIM helpers ────────────────────────────────────────────────────────
+
+const MULTILINE_ENVS = new Set([
+  'align', 'align*', 'aligned', 'gather', 'gather*', 'multline', 'multline*',
+  'tabular', 'array', 'matrix', 'pmatrix', 'bmatrix', 'vmatrix',
+  'itemize', 'enumerate', 'description',
+]);
+
+function resolveFimFormat(model: string, override: FimFormat): Exclude<FimFormat, 'auto'> {
+  if (override !== 'auto') { return override; }
+  const m = model.toLowerCase();
+  if (m.includes('granite')) { return 'granite'; }
+  if (m.includes('qwen'))    { return 'qwen'; }
+  if (m.includes('deepseek')) { return 'deepseek'; }
+  if (m.includes('codellama') || m.includes('code-llama')) { return 'codellama'; }
+  if (m.includes('starcoder')) { return 'starcoder'; }
+  return 'chat';
+}
+
+interface FimPrompt { prompt: string; stop: string[]; }
+
+function buildFimPrompt(format: Exclude<FimFormat, 'auto'>, prefix: string, suffix: string): FimPrompt {
+  switch (format) {
+    case 'granite':
+      return {
+        prompt: `<fim_prefix>${prefix}<fim_suffix>${suffix}<fim_middle>`,
+        stop: ['<fim_pad>', '<|endoftext|>'],
+      };
+    case 'qwen':
+      return {
+        prompt: `<|fim_prefix|>${prefix}<|fim_suffix|>${suffix}<|fim_middle|>`,
+        stop: ['<|fim_pad|>', '<|endoftext|>'],
+      };
+    case 'deepseek':
+      // Uses Unicode fullwidth chars: ｜ = U+FF5C, ▁ = U+2581
+      return {
+        prompt: `<\uFF5Cfim\u2581begin\uFF5C>${prefix}<\uFF5Cfim\u2581hole\uFF5C>${suffix}<\uFF5Cfim\u2581end\uFF5C>`,
+        stop: ['<\uFF5Ccompletion\uFF5C>'],
+      };
+    case 'codellama':
+      return {
+        prompt: `<PRE> ${prefix}<SUF>${suffix}<MID>`,
+        stop: ['<EOT>'],
+      };
+    case 'starcoder':
+      return {
+        prompt: `<fim_prefix>${prefix}<fim_suffix>${suffix}<fim_middle>`,
+        stop: ['<fim_pad>', '<|endoftext|>'],
+      };
+    default:
+      return { prompt: '', stop: [] };
+  }
+}
+
+async function fetchOllamaCompletion(
+  prefix: string,
+  suffix: string,
+  ollamaUrl: string,
+  ollamaModel: string,
+  maxTokens: number,
+  fimFormatOverride: FimFormat,
+): Promise<string> {
+  if (!ollamaModel) {
+    fimLog.appendLine('[FIM] no model configured — select one in the LaTeX Preview sidebar');
+    return '';
+  }
+
+  // Strip complete verbatim blocks before env analysis so their
+  // contents don't poison the stack. Unclosed verbatim (cursor inside)
+  // won't match and will correctly stay on the stack.
+  const VERBATIM_ENVS = 'verbatim|Verbatim|lstlisting|minted|filecontents';
+  const strippedPrefix = prefix.replace(
+    new RegExp(`\\\\begin\\{(${VERBATIM_ENVS})\\}[\\s\\S]*?\\\\end\\{\\1\\}`, 'g'),
+    ''
+  );
+
+  // Build env stack for LaTeX context
+  const envStack: string[] = [];
+  for (const m of strippedPrefix.matchAll(/\\(begin|end)\{([^}]+)\}/g)) {
+    if (m[1] === 'begin') { envStack.push(m[2]); }
+    else if (envStack.at(-1) === m[2]) { envStack.pop(); }
+  }
+  const currentEnv = envStack.at(-1) ?? null;
+
+  const trimmedPrefix = strippedPrefix.slice(-900);
+  const trimmedSuffix = suffix.slice(0, 300);
+
+  const format = resolveFimFormat(ollamaModel, fimFormatOverride);
+
+  fimLog.appendLine(`[FIM] model=${ollamaModel} format=${format} env=${currentEnv ?? 'none'}`);
+  fimLog.appendLine(`[FIM] prefix[-60]=${JSON.stringify(trimmedPrefix.slice(-60))}`);
+  fimLog.appendLine(`[FIM] suffix[+60]=${JSON.stringify(trimmedSuffix.slice(0, 60))}`);
+
+  let res: Response;
+  try {
+    if (format === 'chat') {
+      // 1. Rely on your existing envStack for block environments
+      const MATH_ENVS = new Set(['equation', 'align', 'align*', 'math', 'gather', 'gather*', 'multline', 'multline*', 'displaymath']);
+      const inMathBlockEnv = MATH_ENVS.has(currentEnv ?? '');
+
+      // 2. Check for unclosed \[ or \(
+      // The negative lookahead (?![^]*\\[\])]) ensures no closing tag exists after the opening tag
+      const hasUnclosedBracketMath = /\\[\[(](?![^]*\\[\])])[^]*$/.test(prefix);
+
+      // 3. Count unescaped $ signs, but ONLY in the current paragraph!
+      // This prevents earlier text or comments from permanently breaking the odd/even count.
+      const currentParagraph = prefix.split('\n\n').pop() ?? '';
+      const unescapedDollars = (currentParagraph.replace(/\\\$/g, '').match(/\$/g) || []).length;
+      const hasOddDollars = unescapedDollars % 2 === 1;
+
+      const inMathMode = inMathBlockEnv || hasUnclosedBracketMath || hasOddDollars;
+      const contextNotes = [
+        inMathMode && 'Cursor is inside math mode.',
+        currentEnv && `Innermost open environment: \\begin{${currentEnv}} — do NOT emit \\end{${currentEnv}}.`,
+      ].filter(Boolean).join('\n');
+
+      const systemPrompt = [
+        'You are a LaTeX fill-in-the-middle (FIM) autocomplete engine.',
+        'Output ONLY the raw LaTeX completion text — no prose, no markdown fences.',
+        '1. ONE logical unit: a single command, phrase, expression, or sentence.',
+        '2. Never repeat text already in prefix or suffix.',
+        '3. Never close an environment you did not open.',
+      ].join('\n');
+
+      res = await fetch(`${ollamaUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: ollamaModel,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            {
+              role: 'user',
+              content: (contextNotes ? `Context:\n${contextNotes}\n\n` : '') +
+                `PREFIX:\n${trimmedPrefix}\n\nSUFFIX:\n${trimmedSuffix}\n\nCompletion:`,
+            },
+          ],
+          stream: false,
+          options: { temperature: 0.05, num_predict: maxTokens },
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+    } else {
+      const fim = buildFimPrompt(format, trimmedPrefix, trimmedSuffix);
+      fimLog.appendLine(`[FIM] raw prompt=${JSON.stringify(fim.prompt.slice(0, 120))}…`);
+      fimLog.appendLine(`[FIM] stop tokens=${JSON.stringify(fim.stop)}`);
+
+      res = await fetch(`${ollamaUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: ollamaModel,
+          prompt: fim.prompt,
+          raw: true,
+          stream: false,
+          options: { temperature: 0.05, num_predict: maxTokens, stop: fim.stop },
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+    }
+  } catch (e) {
+    fimLog.appendLine(`[FIM] fetch threw: ${e}`);
+    return '';
+  }
+
+  fimLog.appendLine(`[FIM] HTTP ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text();
+    fimLog.appendLine(`[FIM] error body: ${body}`);
+    return '';
+  }
+
+  const data = await res.json() as { response?: string; message?: { content?: string } };
+  fimLog.appendLine(`[FIM] raw response keys: ${Object.keys(data).join(', ')}`);
+
+  const rawPrediction = format === 'chat'
+    ? (data.message?.content ?? '')
+    : (data.response ?? '');
+
+  fimLog.appendLine(`[FIM] rawPrediction=${JSON.stringify(rawPrediction)}`);
+
+  let prediction = rawPrediction.trimEnd();
+  prediction = prediction.replace(/```[\w]*\n?/g, '').trimEnd();
+
+  if (!MULTILINE_ENVS.has(currentEnv ?? '')) {
+    const beforeSplit = prediction;
+    prediction = prediction.split('\n\n')[0];
+    if (prediction !== beforeSplit) {
+      fimLog.appendLine(`[FIM] trimmed at \\n\\n, was=${JSON.stringify(beforeSplit)}`);
+    }
+  }
+
+  const trimmed = prediction.trim();
+  if (!trimmed) {
+    fimLog.appendLine('[FIM] → empty after trimming');
+    return '';
+  }
+
+  fimLog.appendLine(`[FIM] → final prediction=${JSON.stringify(prediction)}`);
+  return prediction;
 }
 
 // ── Git helpers ───────────────────────────────────────────────────────────────
