@@ -10,9 +10,8 @@ import {
 import {
   latexDecorations, latexDecorationsTheme,
   envDecorations, envDecorationsTheme,
-  diffExtensions, setDiffData,
+  diffInitial, buildDiffExtension, clearDiffExtension,
 } from './decorations/index';
-import type { DiffData } from './decorations/index';
 
 // VSCode webview API — injected by VS Code at runtime
 declare function acquireVsCodeApi(): {
@@ -28,7 +27,7 @@ const vscode = acquireVsCodeApi();
 let editor: EditorView | null = null;
 let rawMode = false;
 let diffEnabled = true;
-let lastDiffData: DiffData = { lines: [], deletions: [], inline: [] };
+let lastOriginal: string | null = null;
 let citationKeys: string[] = [];
 let settingsContentWidth = '780px'; // tracks the last value from settings (not toolbar overrides)
 
@@ -123,11 +122,12 @@ function exitRawMode() {
 
 // ── Diff helpers ─────────────────────────────────────────────────────────────
 
-const emptyDiff: DiffData = { lines: [], deletions: [], inline: [] };
-
 function applyDiff() {
   if (!editor) return;
-  editor.dispatch({ effects: setDiffData.of(diffEnabled ? lastDiffData : emptyDiff) });
+  const effect = (diffEnabled && lastOriginal !== null)
+    ? buildDiffExtension(lastOriginal)
+    : clearDiffExtension();
+  editor.dispatch({ effects: effect });
 }
 
 // ── DOM refs (available at script-run time — script is deferred after body) ──
@@ -215,8 +215,8 @@ function createEditor(initialContent: string): void {
         ...historyKeymap,
       ]),
       autocompletion({ override: [citationCompletionSource] }),
-      // Diff gutter BEFORE lineNumbers so colour bar sits left of line numbers
-      ...diffExtensions,
+      // Diff compartment BEFORE lineNumbers so gutter bar sits left of line numbers
+      diffInitial,
       lineNumbers(),
       highlightActiveLine(),
       latex,
@@ -314,7 +314,7 @@ function createEditor(initialContent: string): void {
 // ── Messages from extension ──────────────────────────────────────────────────
 
 window.addEventListener('message', (event: MessageEvent) => {
-  const msg = event.data as { type: string; text?: string; diff?: DiffData };
+  const msg = event.data as { type: string; text?: string; original?: string | null };
 
   if (msg.type === 'settingsUpdate') {
     const s = (msg as { type: string; settings: { contentWidth: string; splitViewEnabled: boolean } }).settings;
@@ -336,16 +336,11 @@ window.addEventListener('message', (event: MessageEvent) => {
   }
 
   if (msg.type === 'update') {
-    // Cache diff data — only apply to CM6 if the toggle is on
-    if (msg.diff) {
-      lastDiffData = msg.diff;
-      if (diffEnabled && editor) {
-        editor.dispatch({ effects: setDiffData.of(lastDiffData) });
-      }
-    }
+    if (msg.original !== undefined) lastOriginal = msg.original;
 
     if (!editor) {
       createEditor(msg.text!);
+      applyDiff();
       return;
     }
 
@@ -359,14 +354,13 @@ window.addEventListener('message', (event: MessageEvent) => {
         });
       }
     }
+    applyDiff();
     return;
   }
 
-  if (msg.type === 'diff' && msg.diff) {
-    lastDiffData = msg.diff;
-    if (diffEnabled && editor) {
-      editor.dispatch({ effects: setDiffData.of(lastDiffData) });
-    }
+  if (msg.type === 'diff' && msg.original !== undefined) {
+    lastOriginal = msg.original;
+    applyDiff();
   }
 
   if (msg.type === 'scrollSync') {

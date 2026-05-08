@@ -4,19 +4,6 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { getSettings } from './settings';
 
-// ── Diff types (mirrored from webview/decorations/diff.ts) ───────────────────
-
-interface DiffLine { line: number; type: 'added' | 'modified'; }
-interface DiffDeleted { afterLine: number; }
-interface InlineSpan {
-  line: number;   // 1-based line in new file
-  from: number;   // char offset within that line (0-based, in clean new-file text)
-  to: number;     // exclusive
-  type: 'add' | 'del';
-  text?: string;  // only for 'del': the removed text to show inline
-}
-interface DiffData { lines: DiffLine[]; deletions: DiffDeleted[]; inline: InlineSpan[]; }
-
 export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
   public static readonly viewType = 'latex-preview.editor';
 
@@ -122,11 +109,11 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     bibWatcher.onDidCreate(onBibChange);
     bibWatcher.onDidDelete(onBibChange);
 
-    const sendContent = (diff?: DiffData) => {
+    const sendContent = () => {
       webviewPanel.webview.postMessage({
         type: 'update',
         text: document.getText(),
-        diff: diff ?? computeGitDiff(document.uri),
+        original: getGitHead(document.uri),
       });
     };
 
@@ -199,12 +186,12 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
       }
     });
 
-    // Recompute diff on save so decorations reflect the committed baseline
+    // Recompute HEAD on save so the diff baseline stays current after each commit
     const saveSubscription = vscode.workspace.onDidSaveTextDocument((saved) => {
       if (saved.uri.toString() === document.uri.toString()) {
         webviewPanel.webview.postMessage({
           type: 'diff',
-          diff: computeGitDiff(document.uri),
+          original: getGitHead(document.uri),
         });
       }
     });
@@ -452,98 +439,17 @@ function parseBibKeys(content: string): string[] {
   return keys;
 }
 
-// ── Git diff helpers ──────────────────────────────────────────────────────────
+// ── Git helpers ───────────────────────────────────────────────────────────────
 
-function computeGitDiff(docUri: vscode.Uri): DiffData {
+function getGitHead(docUri: vscode.Uri): string | null {
   const filePath = docUri.fsPath;
   const dir = path.dirname(filePath);
   const file = path.basename(filePath);
-  const result = spawnSync('git', ['diff', 'HEAD', '--word-diff=plain', '--', file], {
+  const result = spawnSync('git', ['show', `HEAD:./${file}`], {
     cwd: dir,
     encoding: 'utf8',
     timeout: 3000,
   });
-  if (result.error || result.status !== 0 || !result.stdout) {
-    return { lines: [], deletions: [], inline: [] };
-  }
-  return parseDiff(result.stdout);
-}
-
-function parseDiff(diff: string): DiffData {
-  const lines: DiffLine[] = [];
-  const deletions: DiffDeleted[] = [];
-  const inline: InlineSpan[] = [];
-  let currentNewLine = 0;
-  let lastDeletionAfterLine = -1;
-
-  for (const raw of diff.split('\n')) {
-    if (raw.startsWith('@@')) {
-      const m = /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
-      if (m) currentNewLine = parseInt(m[1], 10) - 1;
-    } else if (raw.startsWith('+') && !raw.startsWith('+++')) {
-      // Pure addition — entire line is new
-      currentNewLine++;
-      const content = raw.slice(1);
-      lines.push({ line: currentNewLine, type: 'added' });
-      if (content.length > 0) {
-        inline.push({ line: currentNewLine, from: 0, to: content.length, type: 'add' });
-      }
-    } else if (raw.startsWith('-') && !raw.startsWith('---')) {
-      // Pure deletion — line removed, show a red bar once per group
-      if (lastDeletionAfterLine !== currentNewLine) {
-        deletions.push({ afterLine: currentNewLine });
-        lastDeletionAfterLine = currentNewLine;
-      }
-    } else if (
-      raw.length > 0 &&
-      !raw.startsWith('\\') &&
-      !raw.startsWith('diff') &&
-      !raw.startsWith('index') &&
-      !raw.startsWith('---') &&
-      !raw.startsWith('+++')
-    ) {
-      // Context line (space prefix) — may carry inline word-diff markers
-      currentNewLine++;
-      const content = raw.startsWith(' ') ? raw.slice(1) : raw;
-      const hasMarkers = content.includes('[-') || content.includes('{+');
-      if (hasMarkers) {
-        lines.push({ line: currentNewLine, type: 'modified' });
-        parseWordDiffMarkers(content, currentNewLine, inline);
-      }
-    }
-  }
-
-  return { lines, deletions, inline };
-}
-
-/** Parse `[-deleted-]` and `{+added+}` markers from a word-diff context line.
- *  Computes character offsets in the clean new-file text (markers removed). */
-function parseWordDiffMarkers(content: string, lineNum: number, inline: InlineSpan[]) {
-  let col = 0; // column in the clean new-file version of this line
-  let i = 0;
-
-  while (i < content.length) {
-    if (content[i] === '[' && content[i + 1] === '-') {
-      const end = content.indexOf('-]', i + 2);
-      if (end !== -1) {
-        const deleted = content.slice(i + 2, end);
-        // Insert a widget BEFORE col to show deleted text in red
-        inline.push({ line: lineNum, from: col, to: col, type: 'del', text: deleted });
-        i = end + 2;
-        continue;
-      }
-    }
-    if (content[i] === '{' && content[i + 1] === '+') {
-      const end = content.indexOf('+}', i + 2);
-      if (end !== -1) {
-        const added = content.slice(i + 2, end);
-        inline.push({ line: lineNum, from: col, to: col + added.length, type: 'add' });
-        col += added.length;
-        i = end + 2;
-        continue;
-      }
-    }
-    col++;
-    i++;
-  }
+  if (result.error || result.status !== 0) return null;
+  return result.stdout;
 }

@@ -2,7 +2,7 @@
   "name": "latex-preview-editor",
   "displayName": "LaTeX Preview Editor",
   "description": "Overleaf-style hybrid WYSIWYG LaTeX editor",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "repository": {
     "type": "git",
     "url": "https://github.com/joon-klaps/latex-preview-editor-vscode.git"
@@ -10,7 +10,7 @@
   "publisher": "joon-klaps",
   "License": "MIT",
   "engines": {
-    "vscode":  "^1.116.0"
+    "vscode": "^1.116.0"
   },
   "categories": [
     "Other"
@@ -58,7 +58,13 @@
         "latex-preview-editor.contentWidth": {
           "type": "string",
           "default": "780px",
-          "enum": ["680px", "780px", "960px", "1200px", "100%"],
+          "enum": [
+            "680px",
+            "780px",
+            "960px",
+            "1200px",
+            "100%"
+          ],
           "description": "Default editor content width."
         }
       }
@@ -79,6 +85,7 @@
     "@codemirror/commands": "^6.0.0",
     "@codemirror/language": "^6.0.0",
     "@codemirror/legacy-modes": "^6.0.0",
+    "@codemirror/merge": "^6.12.1",
     "@codemirror/state": "^6.0.0",
     "@codemirror/view": "^6.0.0",
     "codemirror": "^6.0.0",
