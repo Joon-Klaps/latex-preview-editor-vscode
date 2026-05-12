@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { spawnSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import Anthropic from '@anthropic-ai/sdk';
 import { getSettings, type FimFormat } from './settings';
 
 const fimLog = vscode.window.createOutputChannel('LaTeX Preview – FIM');
@@ -99,14 +100,19 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
           break;
 
         case 'complete': {
-          const { id, prefix, suffix } = msg as { type: string; id: string; prefix: string; suffix: string };
-          fimLog.show(true);
-          fimLog.appendLine(`[FIM] complete message received id=${id.slice(0, 6)}`);
+          const { id, prefix, suffix, backend } = msg as { type: string; id: string; prefix: string; suffix: string; backend?: string };
+          fimLog.appendLine(`[FIM] complete message received id=${id.slice(0, 6)} backend=${backend}`);
           let prediction = '';
           try {
-            const { ollamaUrl, ollamaModel, ollamaMaxTokens, ollamaFimFormat } = getSettings();
-            fimLog.appendLine(`ollamaUrl=${ollamaUrl}, ollamaModel=${ollamaModel}, ollamaMaxTokens=${ollamaMaxTokens}, ollamaFimFormat=${ollamaFimFormat}`);
-            prediction = await fetchOllamaCompletion(prefix, suffix, ollamaUrl, ollamaModel, ollamaMaxTokens, ollamaFimFormat);
+            const settings = getSettings();
+            const apiKey = settings.claudeApiKey || process.env['ANTHROPIC_API_KEY'] || '';
+            if (backend === 'claude') {
+              fimLog.appendLine(`[FIM] backend=claude`);
+              prediction = await fetchClaudeCompletion(prefix, suffix, apiKey, settings.ollamaMaxTokens);
+            } else {
+              fimLog.appendLine(`[FIM] backend=ollama model=${settings.ollamaModel}`);
+              prediction = await fetchOllamaCompletion(prefix, suffix, settings.ollamaUrl, settings.ollamaModel, settings.ollamaMaxTokens, settings.ollamaFimFormat);
+            }
           } catch (e) {
             fimLog.appendLine(`[FIM] outer catch: ${e}`);
           }
@@ -315,9 +321,14 @@ export class LaTeXEditorProvider implements vscode.CustomTextEditorProvider {
     </select>
     <div class="tb-sep"></div>
     <button class="tb-btn tb-btn-active" data-cmd="toggleDiff" title="Toggle diff decorations (on by default)">± Diff</button>
+    <button class="tb-btn tb-btn-active" data-cmd="toggleAI" title="Toggle AI inline completion">⚡ AI</button>
+    <select id="tb-backend" class="tb-select" title="Completion backend" style="width:72px">
+      <option value="ollama">Ollama</option>
+      <option value="claude">Claude</option>
+    </select>
     <div class="tb-sep"></div>
     <button class="tb-btn" data-cmd="reopen"    title="Switch to plain text view">⊞ Text</button>
-    <span id="fim-status" title="Ollama generating…">⚙</span>
+    <span id="fim-status" title="Generating…">⚙</span>
   </div>
   <div id="editor"></div>
   <div id="raw-view"><textarea id="raw-text" spellcheck="false"></textarea></div>
@@ -402,6 +413,90 @@ function buildFimPrompt(format: Exclude<FimFormat, 'auto'>, prefix: string, suff
     default:
       return { prompt: '', stop: [] };
   }
+}
+
+async function fetchClaudeCompletion(
+  prefix: string,
+  suffix: string,
+  apiKey: string,
+  maxTokens: number,
+): Promise<string> {
+  if (!apiKey) {
+    fimLog.appendLine('[FIM] Claude: no API key — set ANTHROPIC_API_KEY or latex-preview-editor.claudeApiKey');
+    return '';
+  }
+
+  // Same context trimming as Ollama path
+  const VERBATIM_ENVS = 'verbatim|Verbatim|lstlisting|minted|filecontents';
+  const strippedPrefix = prefix.replace(
+    new RegExp(`\\\\begin\\{(${VERBATIM_ENVS})\\}[\\s\\S]*?\\\\end\\{\\1\\}`, 'g'),
+    ''
+  );
+  const envStack: string[] = [];
+  for (const m of strippedPrefix.matchAll(/\\(begin|end)\{([^}]+)\}/g)) {
+    if (m[1] === 'begin') { envStack.push(m[2]); }
+    else if (envStack.at(-1) === m[2]) { envStack.pop(); }
+  }
+  const currentEnv = envStack.at(-1) ?? null;
+  const trimmedPrefix = strippedPrefix.slice(-400);
+  const trimmedSuffix = suffix.split('\n\n')[0].slice(0, 200);
+
+  const systemLines = [
+    'You are an inline LaTeX autocomplete engine.',
+    'Output ONLY the text to insert at the cursor — one phrase, clause, or command.',
+    'No prose explanation. No markdown fences. Never close an environment you did not open.',
+  ];
+  if (currentEnv) {
+    systemLines.push(`The innermost open environment is \\begin{${currentEnv}} — do NOT emit \\end{${currentEnv}}.`);
+  }
+
+  fimLog.appendLine(`[FIM] Claude: env=${currentEnv ?? 'none'} prefix[-60]=${JSON.stringify(trimmedPrefix.slice(-60))}`);
+
+  let rawPrediction: string;
+  try {
+    const client = new Anthropic({ apiKey });
+    const response = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: maxTokens,
+      system: systemLines.join('\n'),
+      messages: [{
+        role: 'user',
+        content: `Complete the LaTeX at the cursor.\n\nBefore cursor:\n${trimmedPrefix}\n\nAfter cursor:\n${trimmedSuffix}`,
+      }],
+    });
+    rawPrediction = response.content[0].type === 'text' ? response.content[0].text : '';
+  } catch (e) {
+    fimLog.appendLine(`[FIM] Claude fetch error: ${e}`);
+    return '';
+  }
+
+  fimLog.appendLine(`[FIM] Claude raw=${JSON.stringify(rawPrediction)}`);
+
+  // Shared post-processing (same rules as Ollama path)
+  let prediction = rawPrediction.trimEnd();
+  prediction = prediction.replace(/```[\w]*\n?/g, '').trimEnd();
+
+  const FIM_TOKEN_RE = /<(?:\/?fim_\w+|PRE|SUF|MID|EOT)>|<[|｜](?:fim_\w+|endoftext)[|｜]>/;
+  const specialIdx = prediction.search(FIM_TOKEN_RE);
+  if (specialIdx === 0) { return ''; }
+  if (specialIdx > 0) { prediction = prediction.slice(0, specialIdx).trimEnd(); }
+
+  if (!MULTILINE_ENVS.has(currentEnv ?? '')) {
+    const cursorMidLine = !trimmedPrefix.endsWith('\n') && trimmedPrefix !== '';
+    prediction = cursorMidLine ? prediction.split('\n')[0] : prediction.split('\n\n')[0];
+  }
+
+  const cursorMidLine = !trimmedPrefix.endsWith('\n') && trimmedPrefix !== '';
+  if (cursorMidLine && /^\s*\\(?:section|chapter|subsection|subsubsection|paragraph|begin|end|label|vspace|hspace|newpage|clearpage|par)\b/.test(prediction)) {
+    fimLog.appendLine('[FIM] Claude → rejected: block command mid-line');
+    return '';
+  }
+
+  const trimmed = prediction.trim();
+  if (!trimmed) { return ''; }
+
+  fimLog.appendLine(`[FIM] Claude → final=${JSON.stringify(prediction)}`);
+  return prediction;
 }
 
 async function fetchOllamaCompletion(

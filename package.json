@@ -62,6 +62,21 @@
           ],
           "description": "Default editor content width."
         },
+        "latex-preview-editor.completionBackend": {
+          "type": "string",
+          "default": "claude",
+          "enum": ["claude", "ollama"],
+          "enumDescriptions": [
+            "Use Anthropic claude-haiku-4-5 via the API (set ANTHROPIC_API_KEY or claudeApiKey)",
+            "Use a local Ollama model (configure ollamaUrl and ollamaModel)"
+          ],
+          "description": "Which backend to use for inline completions."
+        },
+        "latex-preview-editor.claudeApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key for Claude completions. Falls back to the ANTHROPIC_API_KEY environment variable if empty."
+        },
         "latex-preview-editor.ollamaUrl": {
           "type": "string",
           "default": "http://localhost:11434",
@@ -116,6 +131,7 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
     "@codemirror/autocomplete": "^6.20.2",
     "@codemirror/commands": "^6.0.0",
     "@codemirror/language": "^6.0.0",

@@ -28,6 +28,7 @@ const vscode = acquireVsCodeApi();
 let editor: EditorView | null = null;
 let rawMode = false;
 let diffEnabled = true;
+let aiEnabled = true;
 let lastOriginal: string | null = null;
 let citationKeys: string[] = [];
 let settingsContentWidth = '780px'; // tracks the last value from settings (not toolbar overrides)
@@ -71,12 +72,12 @@ const pendingCompletions = new Map<string, (prediction: string) => void>();
 const fimStatusEl = document.getElementById('fim-status') as HTMLElement | null;
 
 function requestCompletion(prefix: string, suffix: string): Promise<string> {
+  if (!aiEnabled) { return Promise.resolve(''); }
   return new Promise((resolve) => {
     const id = crypto.randomUUID();
     pendingCompletions.set(id, resolve);
     if (fimStatusEl) { fimStatusEl.style.display = ''; }
-    console.log('[LaTeX FIM] → request', id.slice(0, 6), '| prefix[-40]:', JSON.stringify(prefix.slice(-40)));
-    vscode.postMessage({ type: 'complete', id, prefix, suffix });
+    vscode.postMessage({ type: 'complete', id, prefix, suffix, backend: currentBackend });
   });
 }
 
@@ -150,6 +151,7 @@ let currentFont = '';   // '' = use VS Code default (CSS variable)
 let currentFontSize = 14;
 let currentAlign: 'left' | 'justify' = 'left';
 let currentMaxWidth = '780px';
+let currentBackend: 'ollama' | 'claude' = 'ollama';
 
 function applyEditorStyles() {
   const content = document.querySelector<HTMLElement>('.cm-content');
@@ -181,6 +183,9 @@ function applyEditorStyles() {
 (document.getElementById('tb-width') as HTMLSelectElement).addEventListener('change', (e) => {
   currentMaxWidth = (e.target as HTMLSelectElement).value;
   applyEditorStyles();
+});
+(document.getElementById('tb-backend') as HTMLSelectElement).addEventListener('change', (e) => {
+  currentBackend = (e.target as HTMLSelectElement).value as 'ollama' | 'claude';
 });
 
 // Textarea → extension (only fires when rawMode is active)
@@ -268,7 +273,7 @@ function createEditor(initialContent: string): void {
           color: 'var(--vscode-editorLineNumber-foreground)',
         },
         '.cm-activeLine': { background: 'var(--vscode-editor-lineHighlightBackground)' },
-        '.cm-cursor': { borderLeftColor: 'var(--vscode-editorCursor-foreground)' },
+        '.cm-cursor': { borderLeftColor: 'var(--vscode-editorCursor-foreground, #AEAFAD)', borderLeftWidth: '2px' },
         '.cm-selectionBackground, ::selection': {
           background: 'var(--vscode-editor-selectionBackground)',
         },
@@ -303,6 +308,12 @@ function createEditor(initialContent: string): void {
         diffBtn.classList.toggle('tb-btn-active', diffEnabled);
         applyDiff();
         break;
+      case 'toggleAI': {
+        aiEnabled = !aiEnabled;
+        const aiBtn = document.querySelector<HTMLElement>('[data-cmd="toggleAI"]');
+        aiBtn?.classList.toggle('tb-btn-active', aiEnabled);
+        break;
+      }
     }
   });
 }
@@ -313,13 +324,18 @@ window.addEventListener('message', (event: MessageEvent) => {
   const msg = event.data as { type: string; text?: string; original?: string | null };
 
   if (msg.type === 'settingsUpdate') {
-    const s = (msg as { type: string; settings: { contentWidth: string } }).settings;
+    const s = (msg as { type: string; settings: { contentWidth: string; completionBackend: 'ollama' | 'claude' } }).settings;
     if (s.contentWidth !== settingsContentWidth) {
       settingsContentWidth = s.contentWidth;
       currentMaxWidth = s.contentWidth;
       const widthSel = document.getElementById('tb-width') as HTMLSelectElement | null;
       if (widthSel) widthSel.value = s.contentWidth;
       applyEditorStyles();
+    }
+    if (s.completionBackend) {
+      currentBackend = s.completionBackend;
+      const backendSel = document.getElementById('tb-backend') as HTMLSelectElement | null;
+      if (backendSel) backendSel.value = s.completionBackend;
     }
     return;
   }
